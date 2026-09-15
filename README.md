@@ -11,6 +11,12 @@
   <a href=https://modelscope.cn/studios/Tencent-Hunyuan/AuK target="_blank"><img src=https://img.shields.io/badge/%F0%9F%A4%96%20ModelScope-Demo%20Space-624aff.svg height=22px></a>
 </div>
 
+<div align="center">
+  <a href="https://paperswithcode.co/api/v1/papers/2609.08936/leaderboard-badge-link?eval=29442" target="_blank"><img src="https://paperswithcode.co/api/v1/papers/2609.08936/leaderboard-badge.svg?eval=29442&amp;live=1" height="22px"></a>
+  <a href="https://paperswithcode.co/api/v1/papers/2609.08936/leaderboard-badge-link?eval=29438" target="_blank"><img src="https://paperswithcode.co/api/v1/papers/2609.08936/leaderboard-badge.svg?eval=29438&amp;live=1" height="22px"></a>
+  <a href="https://paperswithcode.co/api/v1/papers/2609.08936/leaderboard-badge-link?eval=29440" target="_blank"><img src="https://paperswithcode.co/api/v1/papers/2609.08936/leaderboard-badge.svg?eval=29440&amp;live=1" height="22px"></a>
+</div>
+
 <p align="center">
 💻 Try our model on the <a href="https://huggingface.co/spaces/tencent/AuK">HuggingFace Space</a> · <a href="https://modelscope.cn/studios/Tencent-Hunyuan/AuK">ModelScope Space</a>!
 </p>
