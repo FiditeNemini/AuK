@@ -79,10 +79,25 @@ def weighted_mse(
     loss_mask: torch.Tensor,
     sample_weight: torch.Tensor,
     eps: float,
+    *,
+    mean_per_sample: bool = False,
 ) -> torch.Tensor:
-    """MSE over masked frames, every sample's frames scaled by its routing weight."""
-    weight = expand_time(sample_weight, prediction) * loss_mask.expand_as(prediction).to(prediction.dtype)
-    return ((prediction - target).square() * weight).sum() / weight.sum().clamp_min(eps)
+    """MSE over masked frames, every sample's frames scaled by its routing weight.
+
+    Frames are pooled across the whole batch by default, so longer samples carry
+    proportionally more of the loss. With mean_per_sample each sample is reduced
+    to its own masked MSE first and the weights then average those, making every
+    sample count the same regardless of length.
+    """
+    mask = loss_mask.expand_as(prediction).to(prediction.dtype)
+    squared = (prediction - target).square()
+    if mean_per_sample:
+        reduce_dims = tuple(range(1, prediction.ndim))
+        per_sample = (squared * mask).sum(dim=reduce_dims) / mask.sum(dim=reduce_dims).clamp_min(eps)
+        weight = sample_weight.to(per_sample.dtype)
+        return (per_sample * weight).sum() / weight.sum().clamp_min(eps)
+    weight = expand_time(sample_weight, prediction) * mask
+    return (squared * weight).sum() / weight.sum().clamp_min(eps)
 
 
 def sample_decoupled_time(
@@ -425,6 +440,7 @@ class DMDEditSystem(nn.Module):
             batch.loss_mask,
             reg_sample_weight,
             self.eps,
+            mean_per_sample=True,
         )
         metrics.update(
             {

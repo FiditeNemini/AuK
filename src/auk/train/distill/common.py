@@ -12,11 +12,12 @@ from accelerate import Accelerator
 from ema_pytorch import EMA
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
-from transformers import Qwen2_5OmniThinkerForConditionalGeneration
+from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
 from transformers.feature_extraction_utils import BatchFeature
 
 from auk.model import Flux2Edit
 from auk.model.utils import lens_to_mask
+from auk.train.train import AukJsonlDataset
 
 
 # Per-step generator seeds are laid out on these strides so no two ranks, updates,
@@ -48,6 +49,10 @@ class DistillScriptArgs:
 
     train_jsonl: str
     config: str = field(default="ckpts/AuK/config.yaml", metadata={"help": "model config yaml (reads model.* only)"})
+    dataset_class: Literal["AukJsonlDataset", "AukJsonlDistillDataset"] = field(
+        default="AukJsonlDataset",
+        metadata={"help": "AukJsonlDistillDataset requires a 'task' field per record and emits _tasks for routing"},
+    )
     teacher_ckpt: str = field(
         default="ckpts/AuK/auk_base.safetensors",
         metadata={"help": "teacher weights; .safetensors release or training .pt"},
@@ -61,6 +66,37 @@ class DistillScriptArgs:
         metadata={"help": "backbone weight dtype (flash_attn requires bf16/fp16)"},
     )
     attn_backend: str = field(default="torch", metadata={"help": "override model.arch.attn_backend"})
+
+
+class AukJsonlDistillDataset(AukJsonlDataset):
+    """AukJsonlDataset plus the per-record task label that task routing selects on."""
+
+    def __init__(self, jsonl_path: str, processor: Qwen2_5OmniProcessor):
+        super().__init__(jsonl_path, processor)
+        # Validated up front: a missing label would otherwise surface mid-training,
+        # and guessing one silently routes the sample to the wrong objective.
+        missing = [index for index, row in enumerate(self.data) if "task" not in row]
+        if missing:
+            raise ValueError(
+                f"{jsonl_path}: {len(missing)} of {len(self.data)} records have no 'task' field "
+                f"(first at record {missing[0]}); task routing needs an explicit label on every record"
+            )
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        item = super().__getitem__(index)
+        item["task"] = self.data[index]["task"]
+        return item
+
+    def collate_fn(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        collated = super().collate_fn(batch)
+        collated["_tasks"] = [item["task"] for item in batch]
+        return collated
+
+
+def build_train_dataset(args: DistillScriptArgs, processor: Qwen2_5OmniProcessor) -> AukJsonlDataset:
+    if args.dataset_class == "AukJsonlDistillDataset":
+        return AukJsonlDistillDataset(args.train_jsonl, processor)
+    return AukJsonlDataset(args.train_jsonl, processor)
 
 
 @dataclass(kw_only=True)

@@ -33,12 +33,13 @@ from auk.train.distill.common import (
     FrozenQwenConditioner,
     VAEConditioningAdapter,
     build_backbone,
+    build_train_dataset,
     configure_logging,
     load_text_encoder,
 )
 from auk.train.distill.initializer.consistency import CMConfig, CMWeighting, ConsistencyInitSystem
 from auk.train.distill.initializer.trainer import InitializerTrainer
-from auk.train.train import AukJsonlDataset, DynamicBatchSampler
+from auk.train.train import DynamicBatchSampler
 
 
 configure_logging()
@@ -236,7 +237,7 @@ def main() -> None:
         accelerator=Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]),
     )
 
-    train_dataset = AukJsonlDataset(args.train_jsonl, text_processor)
+    train_dataset = build_train_dataset(args, text_processor)
     trainer.accelerator.even_batches = False
     batch_sampler = DynamicBatchSampler(
         SequentialSampler(train_dataset),
