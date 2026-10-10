@@ -1,4 +1,4 @@
-"""Training adapter and alternating optimizer loop for VAE DMD."""
+"""Alternating fake-score / student optimizer loop for DMD."""
 
 from __future__ import annotations
 
@@ -9,35 +9,13 @@ from typing import Any, Mapping
 
 import torch
 from accelerate import Accelerator
+from ema_pytorch import EMA
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from auk.train.distill.checkpoint import safe_torch_load
-from auk.train.distill.common import (
-    SEED_STRIDE_PER_RANK,
-    SEED_STRIDE_PER_STUDENT_UPDATE,
-    SEED_STRIDE_PER_UPDATE,
-    EMAConfig,
-    PreparedBatch,
-    VAEConditioningAdapter,
-    build_student_ema,
-    reduce_metrics,
-)
+from auk.train.distill.common import PreparedBatch, VAEConditioningAdapter, reduce_metrics
 from auk.train.distill.dmd.checkpoint import load_training_checkpoint, save_training_checkpoint
-from auk.train.distill.dmd.system import DMDEditSystem
-
-
-@dataclass(kw_only=True)
-class DecoupledDMDConfig:
-    """CA/DM decomposition weights, time schedules, and APG settings."""
-
-    ca_weight: float = 1.0
-    dm_weight: float = 1.0
-    ca_time_schedule: str = "uniform"
-    dm_time_schedule: str = "uniform"
-    ca_apg_enabled: bool = False
-    ca_apg_eta: float = 0.0
-    ca_apg_norm_threshold: float = 0.0
+from auk.train.distill.dmd.system import DistillConfig, DMDEditSystem
 
 
 @dataclass
@@ -48,8 +26,6 @@ class DMDUpdateState:
 
 
 class DMDVAETrainer:
-    """Five fake-score updates followed by one student update by default."""
-
     def __init__(
         self,
         *,
@@ -60,14 +36,8 @@ class DMDVAETrainer:
         student_scheduler: LRScheduler,
         fake_score_scheduler: LRScheduler,
         time_grid: torch.Tensor,
-        teacher_provenance: Mapping[str, Any],
+        config: DistillConfig,
         resolved_config: Mapping[str, Any],
-        student_update_interval: int = 5,
-        teacher_cfg_scale: float = 3.0,
-        decoupled: DecoupledDMDConfig,
-        regression_weight: float = 0.0,
-        max_grad_norm: float = 1.0,
-        ema_kwargs: EMAConfig,
         accelerator: Accelerator,
     ):
         self.accelerator = accelerator
@@ -78,29 +48,29 @@ class DMDVAETrainer:
         self.student_scheduler = student_scheduler
         self.fake_score_scheduler = fake_score_scheduler
         self.time_grid = time_grid.to(device=self.accelerator.device, dtype=torch.float32)
-        self.teacher_provenance = teacher_provenance
         self.resolved_config = dict(resolved_config)
-        self.student_update_interval = student_update_interval
-        self.teacher_cfg_scale = teacher_cfg_scale
-        self.decoupled = decoupled
-        self.regression_weight = regression_weight
-        self.max_grad_norm = max_grad_norm
+        self.student_update_interval = config.fake_score_updates_per_student
+        self.max_grad_norm = config.max_grad_norm
         self.update_state = DMDUpdateState()
         self.epoch = 0
         self.batch_cursor = 0
-
-        unwrapped = self.accelerator.unwrap_model(self.system)
-        self.student_ema = build_student_ema(unwrapped.student, self.accelerator.device, ema_kwargs)
+        self.student_ema = EMA(
+            system.student,
+            beta=config.ema_beta,
+            update_after_step=config.ema_update_after_step,
+            update_every=config.ema_update_every,
+            include_online_model=False,
+        ).to(self.accelerator.device)
 
     def step_generator(self, stream: int) -> torch.Generator:
-        generator = torch.Generator(device=self.accelerator.device)
+        # Prime strides keep every (update, rank, loss term) on distinct noise.
         seed = (
-            SEED_STRIDE_PER_UPDATE * (self.update_state.fake_score_updates + 1)
-            + SEED_STRIDE_PER_STUDENT_UPDATE * self.update_state.student_updates
-            + SEED_STRIDE_PER_RANK * self.accelerator.process_index
+            1_000_003 * (self.update_state.fake_score_updates + 1)
+            + 97 * self.update_state.student_updates
+            + 10_000_019 * self.accelerator.process_index
             + stream
         )
-        return generator.manual_seed(seed)
+        return torch.Generator(device=self.accelerator.device).manual_seed(seed)
 
     def step(self, prepared: PreparedBatch) -> dict[str, float]:
         step_start = time.perf_counter()
@@ -111,12 +81,7 @@ class DMDVAETrainer:
             dtype=next(unwrapped.student.parameters()).dtype,
         )
         self.fake_score_optimizer.zero_grad(set_to_none=True)
-        fake_loss, metrics = self.system(
-            mode="fake_score",
-            batch=prepared,
-            time_grid=self.time_grid,
-            generator=self.step_generator(stream=1),
-        )
+        fake_loss, metrics = self.system("fake_score", prepared, self.time_grid, self.step_generator(stream=1))
         self.accelerator.backward(fake_loss)
         fake_grad_norm = self.accelerator.clip_grad_norm_(unwrapped.fake_score.parameters(), self.max_grad_norm)
         self.fake_score_optimizer.step()
@@ -128,21 +93,7 @@ class DMDVAETrainer:
         student_updated = self.update_state.fake_updates_since_student >= self.student_update_interval
         if student_updated:
             self.student_optimizer.zero_grad(set_to_none=True)
-            student_loss, student_metrics = self.system(
-                mode="student",
-                batch=prepared,
-                time_grid=self.time_grid,
-                teacher_cfg_scale=self.teacher_cfg_scale,
-                generator=self.step_generator(stream=2),
-                ca_weight=self.decoupled.ca_weight,
-                dm_weight=self.decoupled.dm_weight,
-                ca_time_schedule=self.decoupled.ca_time_schedule,
-                dm_time_schedule=self.decoupled.dm_time_schedule,
-                ca_apg_enabled=self.decoupled.ca_apg_enabled,
-                ca_apg_eta=self.decoupled.ca_apg_eta,
-                ca_apg_norm_threshold=self.decoupled.ca_apg_norm_threshold,
-                regression_weight=self.regression_weight,
-            )
+            student_loss, student_metrics = self.system("student", prepared, self.time_grid, self.step_generator(stream=2))
             self.accelerator.backward(student_loss)
             student_grad_norm = self.accelerator.clip_grad_norm_(unwrapped.student.parameters(), self.max_grad_norm)
             self.student_optimizer.step()
@@ -185,12 +136,7 @@ class DMDVAETrainer:
             max_keys=("target_frames_max",),
         )
 
-    def save_checkpoint(
-        self,
-        path: Path,
-        *,
-        initializer_provenance: Mapping[str, Any] | None = None,
-    ) -> None:
+    def save_checkpoint(self, path: Path) -> None:
         save_training_checkpoint(
             path,
             accelerator=self.accelerator,
@@ -203,14 +149,12 @@ class DMDVAETrainer:
             update_state=asdict(self.update_state),
             epoch=self.epoch,
             batch_cursor=self.batch_cursor,
-            teacher_provenance=self.teacher_provenance,
             resolved_config=self.resolved_config,
-            initializer_provenance=initializer_provenance,
         )
 
     def load_checkpoint(self, path: Path) -> None:
         restored = load_training_checkpoint(
-            safe_torch_load(path, map_location="cpu"),
+            torch.load(path, map_location="cpu", weights_only=True),
             system=self.accelerator.unwrap_model(self.system),
             student_optimizer=self.student_optimizer,
             fake_score_optimizer=self.fake_score_optimizer,

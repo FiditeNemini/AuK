@@ -8,123 +8,59 @@ import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Mapping
 
 import torch
 from accelerate import Accelerator
+from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs
 from omegaconf import OmegaConf
+from safetensors.torch import load_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, SequentialSampler
-from transformers import HfArgumentParser, Qwen2_5OmniProcessor, get_scheduler
+from transformers import (
+    HfArgumentParser,
+    Qwen2_5OmniProcessor,
+    Qwen2_5OmniThinkerForConditionalGeneration,
+    get_scheduler,
+)
 
+from auk.model import Flux2Edit
 from auk.model.vae import load_vae_model
 from auk.model.vae.bigvgan_flow_vae import BigVGANFlowVAEConfig
-from auk.train.distill.checkpoint import (
-    load_initializer_artifact,
-    load_teacher_checkpoint,
-    make_student_export,
-    teacher_provenance,
-)
+from auk.train.distill.checkpoint import extract_teacher_state, load_initializer_artifact, make_student_export
 from auk.train.distill.common import (
     WEIGHT_DTYPES,
     DistillScriptArgs,
-    EMAConfig,
     FrozenQwenConditioner,
     VAEConditioningAdapter,
-    build_backbone,
     build_train_dataset,
-    configure_logging,
-    load_text_encoder,
 )
-from auk.train.distill.dmd.checkpoint import initialize_dmd_from_initializer, initialize_dmd_roles
-from auk.train.distill.dmd.system import DMDEditSystem, make_dmd_time_grid
-from auk.train.distill.dmd.trainer import DecoupledDMDConfig, DMDVAETrainer
-
-# Data loading is shared with regular fine-tuning: same jsonl schema, same
-# frame-length packing. Only the training objective differs.
+from auk.train.distill.dmd.system import DistillConfig, DMDEditSystem
+from auk.train.distill.dmd.trainer import DMDVAETrainer
 from auk.train.train import DynamicBatchSampler
 
 
-configure_logging()
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class DistillConfig:
-    """DMD hyper-parameters."""
-
-    nfe: int = 4
-    sway_sampling_coef: float = -1.0
-    teacher_cfg_scale: float = 4.0
-    fake_score_updates_per_student: int = 5
-    simulation_free: bool = True
-    regression_weight: float = 1.0
-    eps: float = 1.0e-5
-
-    task_routing: bool = False
-    regression_only_tasks: str = "ss,music,fisher"
-
-    # CA/DM decomposition + APG on the CA branch
-    ca_weight: float = 1.0
-    dm_weight: float = 1.0
-    ca_time_schedule: str = "decoupled-hybrid"  # 'uniform' | 'decoupled-hybrid'
-    dm_time_schedule: str = "uniform"
-    ca_apg: bool = True
-    ca_apg_eta: float = 0.0  # 0 = pure orthogonal projection
-    ca_apg_norm_threshold: float = 0.0
-
-    student_learning_rate: float = 1.0e-5
-    fake_score_learning_rate: float = 1.0e-5
-    weight_decay: float = 0.0
-    scheduler_type: str = "constant"
-    warmup_updates: int = 0
-    max_student_updates: int = 2500
-    max_grad_norm: float = 1.0
-
-    frames_threshold: int = 2700
-    max_samples: int = 8
-    dataloader_num_workers: int = 4
-    seed: int = 666
-
-    ema_beta: float = 0.999
-    ema_update_after_step: int = 0
-    ema_update_every: int = 1
-
-    save_per_student_updates: int = 500
-    last_per_student_updates: int = 100
-    logging_steps: int = 1
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.getLogger().addFilter(lambda record: "System prompt modified" not in record.getMessage())
+logger = get_logger(__name__)
 
 
 @dataclass
 class ScriptArgs(DistillScriptArgs):
-    """Stage-two paths. Kept separate from DistillConfig, which holds hyper-params."""
-
     output_dir: str = "ckpts/auk_dmd"
     checkpoint_every_n_layers: int | None = field(
         default=None,
-        metadata={
-            "help": "override model.arch.checkpoint_every_n_layers; 1 checkpoints every block "
-            "(lowest activation memory, most recompute). Unset keeps the config value."
-        },
+        metadata={"help": "Overrides model.arch.checkpoint_every_n_layers; DMD holds three backbones, so 1 may be needed."},
     )
-    initializer: str | None = field(
+    initialized_student_path: str | None = field(
         default=None,
-        metadata={
-            "help": "consistency artifact from train_init (e.g. ckpts/auk_cm_init/model_500.pt). "
-            "Warm-starts student+fake_score; strongly recommended. Without it both roles start "
-            "from the teacher and DMD converges noticeably slower."
-        },
+        metadata={"help": "Stage-one artifact for student and fake_score; unset starts both from the teacher."},
     )
-    initializer_use_ema: bool = True
+    initialized_student_use_ema: bool = True
 
 
-def save_inference_export(
-    trainer: DMDVAETrainer,
-    fusion: Mapping[str, torch.Tensor],
-    initializer_provenance: Mapping[str, Any] | None,
-    path: Path,
-) -> None:
+def save_inference_export(trainer: DMDVAETrainer, fusion: Mapping[str, torch.Tensor], path: Path) -> None:
     trainer.accelerator.wait_for_everyone()
     if trainer.accelerator.is_main_process:
         student_state = {
@@ -132,20 +68,13 @@ def save_inference_export(
             for key, value in trainer.student_ema.ema_model.state_dict().items()
             if key not in ("initted", "step")
         }
-        metadata = {
-            "time_grid": trainer.time_grid.tolist(),
-            "nfe": trainer.time_grid.numel() - 1,
-            "teacher_provenance": dict(trainer.teacher_provenance),
-        }
-        if initializer_provenance is not None:
-            metadata["initializer_provenance"] = dict(initializer_provenance)
         export = make_student_export(
             ema_state=student_state,
             online_state=student_state,
             fusion_state=fusion,
             update=trainer.update_state.student_updates,
             export_type="dmd_student_inference",
-            metadata=metadata,
+            metadata={"time_grid": trainer.time_grid.tolist(), "nfe": trainer.time_grid.numel() - 1},
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         trainer.accelerator.save(export, path)
@@ -156,6 +85,7 @@ def save_inference_export(
 def main() -> None:
     parser = HfArgumentParser((ScriptArgs, DistillConfig))
     args, distill_config = parser.parse_args_into_dataclasses()
+    accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
 
     model_config = OmegaConf.load(args.config).model
     text_encoder_config = model_config.text_encoder
@@ -164,12 +94,16 @@ def main() -> None:
     torch.manual_seed(distill_config.seed)
 
     saved_config = os.path.join(args.output_dir, "config.yaml")
-    if os.environ.get("RANK", "0") == "0" and not os.path.exists(saved_config):
+    if accelerator.is_main_process and not os.path.exists(saved_config):
         os.makedirs(args.output_dir, exist_ok=True)
         shutil.copy(args.config, saved_config)
 
     logger.info(f"Loading Qwen text encoder from {text_encoder_config.text_encoder_path} ...")
-    thinker = load_text_encoder(text_encoder_config.text_encoder_path)
+    thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+        text_encoder_config.text_encoder_path, torch_dtype=torch.bfloat16
+    )
+    del thinker.visual
+    thinker.visual = None
     text_processor = Qwen2_5OmniProcessor.from_pretrained(text_encoder_config.text_encoder_path)
 
     logger.info(f"Loading VAE from {vae_config.vae_model_path} ...")
@@ -183,44 +117,31 @@ def main() -> None:
     vae_model.eval().requires_grad_(False)
 
     logger.info("Building teacher / student / fake_score backbones ...")
+    arch = OmegaConf.to_container(model_config.arch, resolve=True)
+    arch["attn_backend"] = args.attn_backend
+    if args.checkpoint_every_n_layers is not None:
+        arch["checkpoint_every_n_layers"] = args.checkpoint_every_n_layers
     system = DMDEditSystem(
-        student=build_backbone(model_config, vae_config, args.attn_backend, args.checkpoint_every_n_layers),
-        teacher=build_backbone(model_config, vae_config, args.attn_backend, args.checkpoint_every_n_layers),
-        fake_score=build_backbone(model_config, vae_config, args.attn_backend, args.checkpoint_every_n_layers),
-        eps=distill_config.eps,
-        regression_only_tasks=(
-            tuple(task.strip() for task in distill_config.regression_only_tasks.split(",") if task.strip())
-            if distill_config.task_routing
-            else ()
-        ),
-        simulation_free=distill_config.simulation_free,
+        student=Flux2Edit(**arch, latent_dim=vae_config.latent_dim),
+        teacher=Flux2Edit(**arch, latent_dim=vae_config.latent_dim),
+        fake_score=Flux2Edit(**arch, latent_dim=vae_config.latent_dim),
+        config=distill_config,
     )
 
     logger.info(f"Loading teacher weights from {args.teacher_ckpt} ...")
-    checkpoint = load_teacher_checkpoint(args.teacher_ckpt)
-    if args.initializer:
-        initializer_state, initializer_provenance = load_initializer_artifact(
-            args.initializer,
-            use_ema=args.initializer_use_ema,
-        )
-        fusion = initialize_dmd_from_initializer(
-            system,
-            teacher_checkpoint=checkpoint,
-            teacher_use_ema=args.teacher_use_ema,
-            initializer_state=initializer_state,
-        )
-        logger.info(
-            f"teacher(real_score)={args.teacher_ckpt}; "
-            f"student+fake_score={initializer_provenance['source']} "
-            f"update={initializer_provenance['update']}"
-        )
+    teacher_state, fusion = extract_teacher_state({"model_state_dict": load_file(args.teacher_ckpt, device="cpu")}, use_ema=False)
+    system.teacher.load_state_dict(teacher_state, strict=True)
+    if args.initialized_student_path:
+        student_state = load_initializer_artifact(args.initialized_student_path, use_ema=args.initialized_student_use_ema)
+        logger.info(f"student and fake_score start from {args.initialized_student_path}")
     else:
-        initializer_provenance = None
-        fusion = initialize_dmd_roles(system, checkpoint, use_ema=args.teacher_use_ema)
+        student_state = teacher_state
         logger.warning(
-            "no --initializer given: student and fake_score start from the teacher. "
+            "no --initialized_student_path given: student and fake_score start from the teacher. "
             "Run auk.train.distill.initializer.train first for faster convergence."
         )
+    system.student.load_state_dict(student_state, strict=True)
+    system.fake_score.load_state_dict(student_state, strict=True)
 
     # The three roles run in a single dtype (no autocast): the DMD losses compare
     # teacher/student/fake_score outputs directly, and flash_attn needs bf16/fp16.
@@ -236,19 +157,12 @@ def main() -> None:
     )
 
     student_optimizer = AdamW(
-        system.student.parameters(),
-        lr=distill_config.student_learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=distill_config.weight_decay,
+        system.student.parameters(), lr=distill_config.student_learning_rate, betas=(0.9, 0.95), weight_decay=0.0
     )
     fake_score_optimizer = AdamW(
-        system.fake_score.parameters(),
-        lr=distill_config.fake_score_learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=distill_config.weight_decay,
+        system.fake_score.parameters(), lr=distill_config.fake_score_learning_rate, betas=(0.9, 0.95), weight_decay=0.0
     )
-    interval = distill_config.fake_score_updates_per_student
-    max_fake_updates = distill_config.max_student_updates * interval
+    max_fake_updates = distill_config.max_student_updates * distill_config.fake_score_updates_per_student
     student_scheduler = get_scheduler(
         distill_config.scheduler_type,
         student_optimizer,
@@ -262,32 +176,8 @@ def main() -> None:
         num_training_steps=max_fake_updates,
     )
 
-    decoupled = DecoupledDMDConfig(
-        ca_weight=distill_config.ca_weight,
-        dm_weight=distill_config.dm_weight,
-        ca_time_schedule=distill_config.ca_time_schedule,
-        dm_time_schedule=distill_config.dm_time_schedule,
-        ca_apg_enabled=distill_config.ca_apg,
-        ca_apg_eta=distill_config.ca_apg_eta,
-        ca_apg_norm_threshold=distill_config.ca_apg_norm_threshold,
-    )
-    resolved_config = {
-        "dmd": {
-            **asdict(decoupled),
-            "fake_score_updates_per_student": interval,
-            "teacher_cfg_scale": distill_config.teacher_cfg_scale,
-            "nfe": distill_config.nfe,
-            "sway_sampling_coef": distill_config.sway_sampling_coef,
-            "simulation_free": distill_config.simulation_free,
-            "regression_weight": distill_config.regression_weight,
-        },
-        "optim": {
-            "student_learning_rate": distill_config.student_learning_rate,
-            "fake_score_learning_rate": distill_config.fake_score_learning_rate,
-        },
-        "script_args": asdict(args),
-    }
-
+    time_grid = torch.linspace(0, 1, distill_config.nfe + 1)
+    time_grid = time_grid + distill_config.sway_sampling_coef * (torch.cos(torch.pi / 2 * time_grid) - 1 + time_grid)
     trainer = DMDVAETrainer(
         system=system,
         adapter=adapter,
@@ -295,34 +185,21 @@ def main() -> None:
         fake_score_optimizer=fake_score_optimizer,
         student_scheduler=student_scheduler,
         fake_score_scheduler=fake_score_scheduler,
-        time_grid=make_dmd_time_grid(
-            nfe=distill_config.nfe,
-            sway_sampling_coef=distill_config.sway_sampling_coef,
-        ),
-        teacher_provenance=teacher_provenance(args.teacher_ckpt, use_ema=args.teacher_use_ema),
-        resolved_config=resolved_config,
-        student_update_interval=interval,
-        teacher_cfg_scale=distill_config.teacher_cfg_scale,
-        decoupled=decoupled,
-        regression_weight=distill_config.regression_weight,
-        max_grad_norm=distill_config.max_grad_norm,
-        ema_kwargs=EMAConfig(
-            beta=distill_config.ema_beta,
-            update_after_step=distill_config.ema_update_after_step,
-            update_every=distill_config.ema_update_every,
-        ),
-        accelerator=Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]),
+        time_grid=time_grid,
+        config=distill_config,
+        resolved_config={"dmd": asdict(distill_config), "script_args": asdict(args)},
+        accelerator=accelerator,
     )
 
     train_dataset = build_train_dataset(args, text_processor)
-    trainer.accelerator.even_batches = False
+    accelerator.even_batches = False
     batch_sampler = DynamicBatchSampler(
         SequentialSampler(train_dataset),
         distill_config.frames_threshold,
         max_samples=distill_config.max_samples,
         random_seed=distill_config.seed,
     )
-    dataloader = trainer.accelerator.prepare(
+    dataloader = accelerator.prepare(
         DataLoader(
             train_dataset,
             collate_fn=train_dataset.collate_fn,
@@ -347,7 +224,7 @@ def main() -> None:
             f"resumed from {resume_ckpt} | fake_update={trainer.update_state.fake_score_updates} "
             f"student_update={trainer.update_state.student_updates} epoch={trainer.epoch}"
         )
-    trainer.accelerator.wait_for_everyone()
+    accelerator.wait_for_everyone()
 
     saved_resume_at = -1
     saved_export_at = -1
@@ -358,7 +235,7 @@ def main() -> None:
             metrics = trainer.step(trainer.adapter.prepare_batch(batch))
 
             update = trainer.update_state.fake_score_updates
-            if trainer.accelerator.is_main_process and update % distill_config.logging_steps == 0:
+            if update % distill_config.logging_steps == 0:
                 logger.info(
                     f"[dmd] fake_update={update}/{max_fake_updates} "
                     f"student_update={trainer.update_state.student_updates} "
@@ -367,15 +244,10 @@ def main() -> None:
 
             student_update = trainer.update_state.student_updates
             if metrics["student_updated"] and student_update % distill_config.last_per_student_updates == 0:
-                trainer.save_checkpoint(resume_ckpt, initializer_provenance=initializer_provenance)
+                trainer.save_checkpoint(resume_ckpt)
                 saved_resume_at = student_update
             if metrics["student_updated"] and student_update % distill_config.save_per_student_updates == 0:
-                save_inference_export(
-                    trainer,
-                    fusion,
-                    initializer_provenance,
-                    output_dir / f"model_{student_update}.pt",
-                )
+                save_inference_export(trainer, fusion, output_dir / f"model_{student_update}.pt")
                 saved_export_at = student_update
             if update >= max_fake_updates:
                 reached_update_limit = True
@@ -384,13 +256,11 @@ def main() -> None:
             break
         trainer.epoch += 1
 
-    # The periodic saves above already cover the final update whenever the limit
-    # is a multiple of the save interval.
     final_update = trainer.update_state.student_updates
     if saved_resume_at != final_update:
-        trainer.save_checkpoint(resume_ckpt, initializer_provenance=initializer_provenance)
+        trainer.save_checkpoint(resume_ckpt)
     if saved_export_at != final_update:
-        save_inference_export(trainer, fusion, initializer_provenance, output_dir / f"model_{final_update}.pt")
+        save_inference_export(trainer, fusion, output_dir / f"model_{final_update}.pt")
 
 
 if __name__ == "__main__":

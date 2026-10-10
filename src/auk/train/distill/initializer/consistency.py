@@ -1,13 +1,9 @@
-"""Stage-one initializer objective: consistency distillation.
-
-Adapted to this repository's flow direction (t=0 noise, t=1 data) and to
-comparing clean predictions rather than velocities.
-"""
+"""Stage-one consistency objective, with t=0 noise / t=1 data and clean-prediction targets."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal, Sequence
+from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from torch import nn
@@ -24,20 +20,17 @@ from auk.train.distill.common import (
 )
 
 
-CMWeighting = Literal["default", "sqrt", "one"]
+@dataclass
+class InitConfig:
+    """Initializer hyper-parameters."""
 
-# The shrink schedule weights the sigmoid tail by this gain and counts stage
-# progress in thousands of samples; both are fixed by the schedule shape, not
-# tuned per run.
-RATIO_SIGMOID_GAIN = 8.0
-SAMPLES_PER_STAGE_UNIT = 1000
+    eps: float = 1.0e-5
+    max_updates: int = 500  # measured as the point where CM loss flattens
+    learning_rate: float = 1.0e-5
+    scheduler_type: str = "constant"
+    warmup_updates: int = 0
+    max_grad_norm: float = 1.0
 
-
-@dataclass(kw_only=True)
-class CMConfig:
-    """Consistency objective settings: time pairing, distance, and weighting."""
-
-    tasks: Sequence[str] = field(default_factory=tuple)
     use_cd: bool = True
     teacher_cfg_scale: float = 3.0
     train_p_mean: float = 0.0
@@ -51,18 +44,22 @@ class CMConfig:
     ct_kimg_per_stage: int = 12500
     huber_const: float = 1.0e-8
     use_squared_l2: bool = False
-    weighting: CMWeighting = "default"
+    weighting: Literal["default", "sqrt", "one"] = "default"
 
+    # comma-separated; needs AukJsonlDistillDataset
+    tasks: str = ""
 
-def stage_shrink_ratio(iteration: int, batch_size: int, *, q: float, ratio_limit: float, kimg_per_stage: int) -> float:
-    """Shrink ratio for the r/t time pair, advancing one stage per kimg_per_stage."""
-    stage = iteration * batch_size // (kimg_per_stage * SAMPLES_PER_STAGE_UNIT)
-    return min(1.0 - 1.0 / q ** (stage + 1), ratio_limit)
+    frames_threshold: int = 2700
+    max_samples: int = 8
+    dataloader_num_workers: int = 4
+    seed: int = 666
 
+    ema_beta: float = 0.999
+    ema_update_after_step: int = 0
+    ema_update_every: int = 1
 
-def endpoint_time_from_current(t: torch.Tensor, ratio: float, min_r: float) -> torch.Tensor:
-    """Map the current time to its endpoint via the sigmoid-weighted shrink."""
-    return (t - t * (1.0 - ratio) * (1.0 + RATIO_SIGMOID_GAIN * torch.sigmoid(-t))).clamp_min(min_r)
+    save_per_updates: int = 500
+    logging_steps: int = 1
 
 
 class ConsistencyInitSystem(nn.Module):
@@ -73,14 +70,16 @@ class ConsistencyInitSystem(nn.Module):
     trajectory before DMD starts.
     """
 
-    def __init__(self, *, student: nn.Module, teacher: nn.Module, config: CMConfig, eps: float = 1e-5):
+    def __init__(self, *, student: nn.Module, teacher: nn.Module, config: InitConfig):
         super().__init__()
         self.student = student
         self.teacher = teacher.eval().requires_grad_(False)
         self.config = config
-        self.eps = eps
+        self.eps = config.eps
+        self.tasks = tuple(task.strip() for task in config.tasks.split(",") if task.strip())
 
     def train(self, mode: bool = True) -> "ConsistencyInitSystem":
+        # nn.Module.train recurses into children; the teacher has dropout and must stay in eval.
         super().train(mode)
         self.teacher.eval()
         return self
@@ -103,14 +102,10 @@ class ConsistencyInitSystem(nn.Module):
         )
         canonical_t = torch.sigmoid(normal * cfg.train_p_std + cfg.train_p_mean)
         canonical_t = canonical_t * (cfg.max_time - cfg.min_time) + cfg.min_time
-        ratio = stage_shrink_ratio(
-            iteration + cfg.ct_resume_updates,
-            global_batch_size,
-            q=cfg.ct_q,
-            ratio_limit=cfg.ct_ratio_limit,
-            kimg_per_stage=cfg.ct_kimg_per_stage,
-        )
-        canonical_r = endpoint_time_from_current(canonical_t, ratio, cfg.min_r)
+        stage = (iteration + cfg.ct_resume_updates) * global_batch_size // (cfg.ct_kimg_per_stage * 1000)
+        ratio = min(1.0 - 1.0 / cfg.ct_q ** (stage + 1), cfg.ct_ratio_limit)
+        canonical_r = canonical_t - canonical_t * (1.0 - ratio) * (1.0 + 8.0 * torch.sigmoid(-canonical_t))
+        canonical_r = canonical_r.clamp_min(cfg.min_r)
         invalid = canonical_r >= canonical_t - self.eps
         canonical_t = torch.where(invalid, (canonical_r + self.eps).clamp(max=cfg.max_time), canonical_t)
         canonical_r = canonical_r.minimum(canonical_t - self.eps)
@@ -183,8 +178,8 @@ class ConsistencyInitSystem(nn.Module):
             target = predict_clean(self.student, noisy_endpoint, batch, endpoint, conditional=True)
         per_sample, unweighted = self.cm_distance(prediction, target, batch, current, endpoint)
 
-        if cfg.tasks:
-            weight = task_selection_weight(batch, cfg.tasks)
+        if self.tasks:
+            weight = task_selection_weight(batch, self.tasks)
         else:
             weight = torch.ones_like(per_sample)
         sample_weight = weight.to(per_sample.dtype)

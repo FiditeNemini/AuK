@@ -1,4 +1,4 @@
-"""Checkpoint IO for DMD training: three-role init, resume state, RNG-free like the mainline."""
+"""Resume-checkpoint IO for DMD training."""
 
 from __future__ import annotations
 
@@ -10,36 +10,7 @@ from accelerate import Accelerator
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from auk.train.distill.checkpoint import extract_teacher_state
 from auk.train.distill.dmd.system import DMDEditSystem
-
-
-def initialize_dmd_roles(
-    system: DMDEditSystem,
-    checkpoint: Mapping[str, Any],
-    *,
-    use_ema: bool = True,
-) -> dict[str, torch.Tensor]:
-    """Strictly initialize all three acoustic roles from one teacher state."""
-    backbone, fusion = extract_teacher_state(checkpoint, use_ema=use_ema)
-    for role in (system.teacher, system.student, system.fake_score):
-        role.load_state_dict(backbone, strict=True)
-    return fusion
-
-
-def initialize_dmd_from_initializer(
-    system: DMDEditSystem,
-    *,
-    teacher_checkpoint: Mapping[str, Any],
-    teacher_use_ema: bool,
-    initializer_state: Mapping[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    """Teacher from the base weights, student and fake_score from the stage-one artifact."""
-    teacher_state, fusion = extract_teacher_state(teacher_checkpoint, use_ema=teacher_use_ema)
-    system.teacher.load_state_dict(teacher_state, strict=True)
-    system.student.load_state_dict(initializer_state, strict=True)
-    system.fake_score.load_state_dict(initializer_state, strict=True)
-    return fusion
 
 
 def save_training_checkpoint(
@@ -55,9 +26,7 @@ def save_training_checkpoint(
     update_state: Mapping[str, int],
     epoch: int,
     batch_cursor: int,
-    teacher_provenance: Mapping[str, Any],
     resolved_config: Mapping[str, Any],
-    initializer_provenance: Mapping[str, Any] | None = None,
 ) -> None:
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -72,14 +41,10 @@ def save_training_checkpoint(
             "update_state": dict(update_state),
             "epoch": epoch,
             "batch_cursor": batch_cursor,
-            "teacher_provenance": dict(teacher_provenance),
             "resolved_config": dict(resolved_config),
         }
-        if initializer_provenance is not None:
-            checkpoint["initializer_provenance"] = dict(initializer_provenance)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Write beside the target and rename, so a crash mid-write cannot leave a
-        # half-written model_last.pt as the only resume point.
+        # Write-then-rename so a crash mid-write never leaves a truncated model_last.pt.
         temporary = path.with_name(f".{path.name}.tmp")
         accelerator.save(checkpoint, temporary)
         temporary.replace(path)

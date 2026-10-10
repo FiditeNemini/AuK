@@ -5,32 +5,24 @@ from typing import Any, Mapping
 
 import torch
 from accelerate import Accelerator
-from torch import nn
+from ema_pytorch import EMA
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from auk.train.distill.common import (
-    SEED_STRIDE_PER_RANK,
-    SEED_STRIDE_PER_UPDATE,
-    EMAConfig,
-    PreparedBatch,
-    VAEConditioningAdapter,
-    build_student_ema,
-    reduce_metrics,
-)
+from auk.train.distill.common import PreparedBatch, VAEConditioningAdapter, reduce_metrics
+from auk.train.distill.initializer.consistency import ConsistencyInitSystem, InitConfig
 
 
 class InitializerTrainer:
     def __init__(
         self,
         *,
-        system: nn.Module,
+        system: ConsistencyInitSystem,
         adapter: VAEConditioningAdapter,
         optimizer: Optimizer,
         scheduler: LRScheduler,
+        config: InitConfig,
         resolved_config: Mapping[str, Any],
-        max_grad_norm: float = 1.0,
-        ema_kwargs: EMAConfig,
         accelerator: Accelerator,
     ):
         self.accelerator = accelerator
@@ -38,28 +30,32 @@ class InitializerTrainer:
         self.system, self.optimizer = self.accelerator.prepare(system, optimizer)
         self.scheduler = scheduler
         self.resolved_config = dict(resolved_config)
-        self.max_grad_norm = max_grad_norm
+        self.max_grad_norm = config.max_grad_norm
         self.updates = 0
         self.epoch = 0
-
-        unwrapped = self.accelerator.unwrap_model(self.system)
-        self.student_ema = build_student_ema(unwrapped.student, self.accelerator.device, ema_kwargs)
+        self.student_ema = EMA(
+            system.student,
+            beta=config.ema_beta,
+            update_after_step=config.ema_update_after_step,
+            update_every=config.ema_update_every,
+            include_online_model=False,
+        ).to(self.accelerator.device)
 
     def step(self, prepared: PreparedBatch) -> dict[str, float]:
         step_start = time.perf_counter()
         self.system.train()
         student = self.accelerator.unwrap_model(self.system).student
         prepared = prepared.to(self.accelerator.device, dtype=next(student.parameters()).dtype)
-        # The CM time-pair schedule advances by global samples consumed, so every
-        # rank must agree on the batch size.
+        # The CM time-pair schedule advances by global samples, so all ranks must agree on it.
         global_batch_size = int(
             self.accelerator.reduce(
                 torch.tensor(prepared.clean.shape[0], device=self.accelerator.device, dtype=torch.long),
                 reduction="sum",
             ).item()
         )
+        # Prime strides keep every (update, rank) pair on distinct noise.
         generator = torch.Generator(device=self.accelerator.device).manual_seed(
-            SEED_STRIDE_PER_UPDATE * (self.updates + 1) + SEED_STRIDE_PER_RANK * self.accelerator.process_index
+            1_000_003 * (self.updates + 1) + 10_000_019 * self.accelerator.process_index
         )
         self.optimizer.zero_grad(set_to_none=True)
         loss, metrics = self.system(prepared, self.updates, generator, global_batch_size=global_batch_size)

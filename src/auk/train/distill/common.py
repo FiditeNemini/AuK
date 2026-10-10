@@ -2,45 +2,21 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from ema_pytorch import EMA
-from omegaconf import DictConfig, OmegaConf
 from torch import nn
-from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
+from transformers import Qwen2_5OmniProcessor
 from transformers.feature_extraction_utils import BatchFeature
 
-from auk.model import Flux2Edit
 from auk.model.utils import lens_to_mask
 from auk.train.train import AukJsonlDataset
 
 
-# Per-step generator seeds are laid out on these strides so no two ranks, updates,
-# or loss terms ever draw the same noise.
-SEED_STRIDE_PER_UPDATE = 1_000_003
-SEED_STRIDE_PER_RANK = 10_000_019
-SEED_STRIDE_PER_STUDENT_UPDATE = 97
-
 WEIGHT_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-
-
-def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    # The Qwen processor re-emits this warning for every batch it templates.
-    logging.getLogger().addFilter(lambda record: "System prompt modified" not in record.getMessage())
-
-
-def load_text_encoder(text_encoder_path: str) -> Qwen2_5OmniThinkerForConditionalGeneration:
-    """Load the Thinker for text + reference audio, dropping the unused vision tower."""
-    thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(text_encoder_path, torch_dtype=torch.bfloat16)
-    del thinker.visual
-    thinker.visual = None
-    return thinker
 
 
 @dataclass
@@ -48,24 +24,14 @@ class DistillScriptArgs:
     """Paths and resources shared by both distillation stages."""
 
     train_jsonl: str
-    config: str = field(default="ckpts/AuK/config.yaml", metadata={"help": "model config yaml (reads model.* only)"})
+    config: str = "ckpts/AuK/config.yaml"
     dataset_class: Literal["AukJsonlDataset", "AukJsonlDistillDataset"] = field(
         default="AukJsonlDataset",
-        metadata={"help": "AukJsonlDistillDataset requires a 'task' field per record and emits _tasks for routing"},
+        metadata={"help": "AukJsonlDistillDataset needs a 'task' field on every record."},
     )
-    teacher_ckpt: str = field(
-        default="ckpts/AuK/auk_base.safetensors",
-        metadata={"help": "teacher weights; .safetensors release or training .pt"},
-    )
-    teacher_use_ema: bool = field(
-        default=False,
-        metadata={"help": "read ema_model_state_dict instead of model_state_dict (.pt teachers only)"},
-    )
-    weight_type: Literal["bf16", "fp16", "fp32"] = field(
-        default="bf16",
-        metadata={"help": "backbone weight dtype (flash_attn requires bf16/fp16)"},
-    )
-    attn_backend: str = field(default="torch", metadata={"help": "override model.arch.attn_backend"})
+    teacher_ckpt: str = "ckpts/AuK/auk_base.safetensors"
+    weight_type: Literal["bf16", "fp16", "fp32"] = "bf16"
+    attn_backend: str = field(default="torch", metadata={"help": "Overrides model.arch.attn_backend."})
 
 
 class AukJsonlDistillDataset(AukJsonlDataset):
@@ -73,8 +39,7 @@ class AukJsonlDistillDataset(AukJsonlDataset):
 
     def __init__(self, jsonl_path: str, processor: Qwen2_5OmniProcessor):
         super().__init__(jsonl_path, processor)
-        # Validated up front: a missing label would otherwise surface mid-training,
-        # and guessing one silently routes the sample to the wrong objective.
+        # Fail at startup: a guessed label would silently route the sample to the wrong objective.
         missing = [index for index, row in enumerate(self.data) if "task" not in row]
         if missing:
             raise ValueError(
@@ -97,41 +62,6 @@ def build_train_dataset(args: DistillScriptArgs, processor: Qwen2_5OmniProcessor
     if args.dataset_class == "AukJsonlDistillDataset":
         return AukJsonlDistillDataset(args.train_jsonl, processor)
     return AukJsonlDataset(args.train_jsonl, processor)
-
-
-@dataclass(kw_only=True)
-class EMAConfig:
-    """Student EMA settings."""
-
-    beta: float
-    update_after_step: int
-    update_every: int
-
-
-def build_student_ema(student: nn.Module, device: torch.device, ema_kwargs: EMAConfig) -> EMA:
-    return EMA(
-        student,
-        beta=ema_kwargs.beta,
-        update_after_step=ema_kwargs.update_after_step,
-        update_every=ema_kwargs.update_every,
-        include_online_model=False,
-    ).to(device)
-
-
-def build_backbone(
-    model_config: DictConfig,
-    vae_config: DictConfig,
-    attn_backend: str,
-    checkpoint_every_n_layers: int | None = None,
-) -> Flux2Edit:
-    arch = OmegaConf.to_container(model_config.arch, resolve=True)
-    arch["attn_backend"] = attn_backend
-    # DMD holds three backbones, so its activation peak is far above the single-model
-    # figure the config comment was tuned for. Lowering the stride checkpoints more
-    # blocks (1 = every block) and trades recompute for activation memory.
-    if checkpoint_every_n_layers is not None:
-        arch["checkpoint_every_n_layers"] = checkpoint_every_n_layers
-    return Flux2Edit(**arch, latent_dim=vae_config.latent_dim)
 
 
 @dataclass
@@ -340,7 +270,6 @@ class VAEConditioningAdapter(nn.Module):
             batch["ref_audio_lengths"].to(device=device, dtype=torch.long),
         )
         text, c_mask = self.text_conditioner(batch["cond_inputs"])
-        # Only _tasks is consumed (task routing); the plain jsonl reader omits it.
         metadata = {"_tasks": batch["_tasks"]} if "_tasks" in batch else None
         return PreparedBatch.from_tensors(
             clean=clean.detach(),
