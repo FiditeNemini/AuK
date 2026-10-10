@@ -30,7 +30,6 @@ seed=666
 export PYTHONPATH=src
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONWARNINGS="ignore"
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 mkdir -p "$output_dir"
 tag="$(date +'%Y%m%d_%H%M%S')"
@@ -43,7 +42,6 @@ set -e
 export PYTHONPATH=src
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONWARNINGS="ignore"
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 accelerate launch --num_processes ${num_gpus} --num_machines 1 --mixed_precision bf16 \\
   -m auk.train.train \\
