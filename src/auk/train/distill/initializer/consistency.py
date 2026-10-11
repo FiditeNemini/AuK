@@ -10,13 +10,11 @@ from torch import nn
 
 from auk.train.distill.common import (
     PreparedBatch,
-    add_velocity_noise,
+    add_noise,
     batch_time,
     expand_time,
     guided_velocity,
-    normal_like,
     predict_clean,
-    task_selection_weight,
 )
 
 
@@ -46,12 +44,9 @@ class InitConfig:
     use_squared_l2: bool = False
     weighting: Literal["default", "sqrt", "one"] = "default"
 
-    # comma-separated; needs AukJsonlDistillDataset
-    tasks: str = ""
-
-    frames_threshold: int = 2700
-    max_samples: int = 8
-    dataloader_num_workers: int = 4
+    frames_threshold: int = 10000
+    max_samples: int = 24
+    dataloader_num_workers: int = 2
     seed: int = 666
 
     ema_beta: float = 0.999
@@ -59,6 +54,7 @@ class InitConfig:
     ema_update_every: int = 1
 
     save_per_updates: int = 500
+    last_per_updates: int = 100
     logging_steps: int = 1
 
 
@@ -76,7 +72,6 @@ class ConsistencyInitSystem(nn.Module):
         self.teacher = teacher.eval().requires_grad_(False)
         self.config = config
         self.eps = config.eps
-        self.tasks = tuple(task.strip() for task in config.tasks.split(",") if task.strip())
 
     def train(self, mode: bool = True) -> "ConsistencyInitSystem":
         # nn.Module.train recurses into children; the teacher has dropout and must stay in eval.
@@ -88,28 +83,29 @@ class ConsistencyInitSystem(nn.Module):
         self,
         batch: PreparedBatch,
         iteration: int,
-        generator: torch.Generator | None,
         *,
         global_batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        """Sample the (current, endpoint) time pair on the staged shrink schedule."""
-        cfg = self.config
-        normal = torch.randn(
-            batch.clean.shape[0],
-            device=batch.clean.device,
-            dtype=batch.clean.dtype,
-            generator=generator,
+        """Sample the (current, endpoint) time pair on the staged shrink schedule.
+
+        The schedule is defined on noise levels (1 = pure noise); they are flipped to flow time on return.
+        """
+        config = self.config
+        normal = torch.randn(batch.clean.shape[0], device=batch.clean.device, dtype=batch.clean.dtype)
+        current_noise_level = torch.sigmoid(normal * config.train_p_std + config.train_p_mean)
+        current_noise_level = current_noise_level * (config.max_time - config.min_time) + config.min_time
+        stage = (iteration + config.ct_resume_updates) * global_batch_size // (config.ct_kimg_per_stage * 1000)
+        ratio = min(1.0 - 1.0 / config.ct_q ** (stage + 1), config.ct_ratio_limit)
+        endpoint_noise_level = current_noise_level - current_noise_level * (1.0 - ratio) * (
+            1.0 + 8.0 * torch.sigmoid(-current_noise_level)
         )
-        canonical_t = torch.sigmoid(normal * cfg.train_p_std + cfg.train_p_mean)
-        canonical_t = canonical_t * (cfg.max_time - cfg.min_time) + cfg.min_time
-        stage = (iteration + cfg.ct_resume_updates) * global_batch_size // (cfg.ct_kimg_per_stage * 1000)
-        ratio = min(1.0 - 1.0 / cfg.ct_q ** (stage + 1), cfg.ct_ratio_limit)
-        canonical_r = canonical_t - canonical_t * (1.0 - ratio) * (1.0 + 8.0 * torch.sigmoid(-canonical_t))
-        canonical_r = canonical_r.clamp_min(cfg.min_r)
-        invalid = canonical_r >= canonical_t - self.eps
-        canonical_t = torch.where(invalid, (canonical_r + self.eps).clamp(max=cfg.max_time), canonical_t)
-        canonical_r = canonical_r.minimum(canonical_t - self.eps)
-        return 1.0 - canonical_t, 1.0 - canonical_r, ratio
+        endpoint_noise_level = endpoint_noise_level.clamp_min(config.min_r)
+        invalid = endpoint_noise_level >= current_noise_level - self.eps
+        current_noise_level = torch.where(
+            invalid, (endpoint_noise_level + self.eps).clamp(max=config.max_time), current_noise_level
+        )
+        endpoint_noise_level = endpoint_noise_level.minimum(current_noise_level - self.eps)
+        return 1.0 - current_noise_level, 1.0 - endpoint_noise_level, ratio
 
     def cm_distance(
         self,
@@ -120,41 +116,40 @@ class ConsistencyInitSystem(nn.Module):
         endpoint: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-sample (weighted, unweighted) consistency distance."""
-        cfg = self.config
+        config = self.config
         difference = prediction.float() - target.float()
         mask = batch.loss_mask.expand_as(difference).to(difference.dtype)
         distance = ((difference * mask).square().sum(dim=tuple(range(1, difference.ndim)))).sqrt()
-        if cfg.huber_const > 0:
-            unweighted = torch.sqrt(distance.square() + cfg.huber_const**2) - cfg.huber_const
-        elif cfg.use_squared_l2:
+        if config.huber_const > 0:
+            unweighted = torch.sqrt(distance.square() + config.huber_const**2) - config.huber_const
+        elif config.use_squared_l2:
             unweighted = distance.square()
         else:
             unweighted = distance
         delta = (endpoint - current).clamp_min(self.eps)
-        if cfg.weighting == "default":
+        if config.weighting == "default":
             return unweighted / delta, unweighted
-        if cfg.weighting == "sqrt":
+        if config.weighting == "sqrt":
             return unweighted / delta.sqrt(), unweighted
-        if cfg.weighting == "one":
+        if config.weighting == "one":
             return unweighted, unweighted
-        raise ValueError(f"unsupported CM weighting: {cfg.weighting}")
+        raise ValueError(f"unsupported CM weighting: {config.weighting}")
 
     def forward(
         self,
         batch: PreparedBatch,
         iteration: int,
-        generator: torch.Generator | None = None,
         *,
         global_batch_size: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        cfg = self.config
-        current, endpoint, ratio = self.pair_times(batch, iteration, generator, global_batch_size=global_batch_size)
+        config = self.config
+        current, endpoint, ratio = self.pair_times(batch, iteration, global_batch_size=global_batch_size)
 
-        noise = normal_like(batch.clean, generator)
-        noisy_current = add_velocity_noise(batch.clean, noise, current)
-        if cfg.use_cd:
+        noise = torch.randn_like(batch.clean)
+        noisy_current = add_noise(batch.clean, noise, current)
+        if config.use_cd:
             with torch.no_grad():
-                both = self.teacher(
+                conditional, unconditional = self.teacher(
                     x=noisy_current,
                     text=batch.text,
                     time=batch_time(current, noisy_current.shape[0], noisy_current),
@@ -163,33 +158,26 @@ class ConsistencyInitSystem(nn.Module):
                     ref=batch.ref,
                     ref_mask=batch.ref_mask,
                     cfg_infer=True,
-                )
-                conditional, unconditional = both.chunk(2)
-                velocity = guided_velocity(conditional, unconditional, cfg.teacher_cfg_scale)
+                ).chunk(2)
+                velocity = guided_velocity(conditional, unconditional, config.teacher_cfg_scale)
                 noisy_endpoint = noisy_current + expand_time(endpoint - current, noisy_current) * velocity
         else:
-            noisy_endpoint = add_velocity_noise(batch.clean, noise, endpoint)
+            noisy_endpoint = add_noise(batch.clean, noise, endpoint)
 
         # Both student passes must see the same dropout draw, otherwise the pair
         # differs by dropout noise rather than by the time step alone.
-        with torch.random.fork_rng(devices=[noisy_current.device] if noisy_current.device.type == "cuda" else []):
-            prediction = predict_clean(self.student, noisy_current, batch, current, conditional=True)
+        with torch.random.fork_rng(devices=[noisy_current.device]):
+            prediction = predict_clean(self.student, noisy_current, batch, current)
         with torch.no_grad():
-            target = predict_clean(self.student, noisy_endpoint, batch, endpoint, conditional=True)
+            target = predict_clean(self.student, noisy_endpoint, batch, endpoint)
         per_sample, unweighted = self.cm_distance(prediction, target, batch, current, endpoint)
 
-        if self.tasks:
-            weight = task_selection_weight(batch, self.tasks)
-        else:
-            weight = torch.ones_like(per_sample)
-        sample_weight = weight.to(per_sample.dtype)
-        total = (per_sample * sample_weight).sum() / sample_weight.sum().clamp_min(self.eps)
-        metrics = {
-            "current_time": current.mean(),
-            "endpoint_time": endpoint.mean(),
-            "ct_ratio": torch.tensor(ratio, device=current.device),
-            "consistency_unweighted": unweighted.mean(),
-            "total_loss": total.detach(),
-            "active_fraction": (weight > 0).float().mean(),
+        # Divide by a device tensor: CUDA turns a Python-scalar divisor into a reciprocal multiply, which moves the last bit.
+        total = per_sample.sum() / per_sample.new_tensor(per_sample.shape[0])
+        return total, {
+            "current_time": float(current.mean()),
+            "endpoint_time": float(endpoint.mean()),
+            "ct_ratio": ratio,
+            "consistency_unweighted": float(unweighted.detach().mean()),
+            "total_loss": float(total.detach()),
         }
-        return total, {name: float(value.detach()) for name, value in metrics.items()}

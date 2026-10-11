@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Mapping
 
 import torch
 from accelerate import Accelerator
 from ema_pytorch import EMA
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from torch import nn
+from torch.optim import AdamW
+from transformers import get_scheduler
 
-from auk.train.distill.common import PreparedBatch, VAEConditioningAdapter, reduce_metrics
+from auk.train.distill.common import ema_from_inference_state, ema_to_inference_state, prepare_batch, reduce_metrics
 from auk.train.distill.initializer.consistency import ConsistencyInitSystem, InitConfig
 
 
@@ -18,21 +20,30 @@ class InitializerTrainer:
         self,
         *,
         system: ConsistencyInitSystem,
-        adapter: VAEConditioningAdapter,
-        optimizer: Optimizer,
-        scheduler: LRScheduler,
+        vae_model: nn.Module,
+        text_encoder: nn.Module,
+        fusion: Mapping[str, torch.Tensor],
         config: InitConfig,
         resolved_config: Mapping[str, Any],
         accelerator: Accelerator,
     ):
         self.accelerator = accelerator
-        self.adapter = adapter.to(self.accelerator.device)
-        self.system, self.optimizer = self.accelerator.prepare(system, optimizer)
-        self.scheduler = scheduler
+        self.vae_model = vae_model.to(self.accelerator.device)
+        self.text_encoder = text_encoder.to(self.accelerator.device)
+        self.fusion = {name: value.float().to(self.accelerator.device) for name, value in fusion.items()}
         self.resolved_config = dict(resolved_config)
         self.max_grad_norm = config.max_grad_norm
         self.updates = 0
         self.epoch = 0
+
+        optimizer = AdamW(system.student.parameters(), lr=config.learning_rate, betas=(0.9, 0.95), weight_decay=0.0)
+        self.scheduler = get_scheduler(
+            config.scheduler_type,
+            optimizer,
+            num_warmup_steps=config.warmup_updates,
+            num_training_steps=config.max_updates,
+        )
+        self.system, self.optimizer = self.accelerator.prepare(system, optimizer)
         self.student_ema = EMA(
             system.student,
             beta=config.ema_beta,
@@ -41,24 +52,25 @@ class InitializerTrainer:
             include_online_model=False,
         ).to(self.accelerator.device)
 
-    def step(self, prepared: PreparedBatch) -> dict[str, float]:
+    def step(self, batch: Mapping[str, Any]) -> dict[str, float]:
+        student = self.accelerator.unwrap_model(self.system).student
+        prepared = prepare_batch(
+            batch,
+            vae_model=self.vae_model,
+            text_encoder=self.text_encoder,
+            fusion=self.fusion,
+            dtype=next(student.parameters()).dtype,
+        )
         step_start = time.perf_counter()
         self.system.train()
-        student = self.accelerator.unwrap_model(self.system).student
-        prepared = prepared.to(self.accelerator.device, dtype=next(student.parameters()).dtype)
         # The CM time-pair schedule advances by global samples, so all ranks must agree on it.
         global_batch_size = int(
             self.accelerator.reduce(
-                torch.tensor(prepared.clean.shape[0], device=self.accelerator.device, dtype=torch.long),
-                reduction="sum",
+                torch.tensor(prepared.clean.shape[0], device=self.accelerator.device, dtype=torch.long)
             ).item()
         )
-        # Prime strides keep every (update, rank) pair on distinct noise.
-        generator = torch.Generator(device=self.accelerator.device).manual_seed(
-            1_000_003 * (self.updates + 1) + 10_000_019 * self.accelerator.process_index
-        )
-        self.optimizer.zero_grad(set_to_none=True)
-        loss, metrics = self.system(prepared, self.updates, generator, global_batch_size=global_batch_size)
+        self.optimizer.zero_grad()
+        loss, metrics = self.system(prepared, self.updates, global_batch_size=global_batch_size)
         self.accelerator.backward(loss)
         grad_norm = self.accelerator.clip_grad_norm_(student.parameters(), self.max_grad_norm)
         self.optimizer.step()
@@ -76,3 +88,38 @@ class InitializerTrainer:
             }
         )
         return reduce_metrics(self.accelerator, metrics)
+
+    def save_checkpoint(self, path: Path, *, with_training_state: bool) -> None:
+        """Write a file AukInfer loads directly; with_training_state adds what resuming needs."""
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            checkpoint = {
+                "ema_model_state_dict": ema_to_inference_state(self.student_ema, self.fusion),
+                "update": self.updates,
+                "metadata": {"resolved_config": self.resolved_config},
+            }
+            if with_training_state:
+                checkpoint.update(
+                    {
+                        "student_model_state_dict": self.accelerator.unwrap_model(self.system).student.state_dict(),
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                        "scheduler_state_dict": self.scheduler.state_dict(),
+                        "epoch": self.epoch,
+                    }
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Write-then-rename so a crash mid-write never leaves a truncated model_last.pt.
+            temporary = path.with_name(f".{path.name}.tmp")
+            self.accelerator.save(checkpoint, temporary)
+            temporary.replace(path)
+        self.accelerator.wait_for_everyone()
+
+    def load_checkpoint(self, path: Path) -> None:
+        """Restore a file written by save_checkpoint(with_training_state=True)."""
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        self.accelerator.unwrap_model(self.system).student.load_state_dict(checkpoint["student_model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        ema_from_inference_state(self.student_ema, checkpoint["ema_model_state_dict"])
+        self.updates = checkpoint["update"]
+        self.epoch = checkpoint["epoch"]

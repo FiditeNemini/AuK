@@ -16,8 +16,8 @@ attn_backend=torch
 # InitConfig
 max_updates=500
 learning_rate=1e-5
-frames_threshold=1500
-max_samples=4
+frames_threshold=10000
+max_samples=24
 dataloader_num_workers=2
 logging_steps=1
 save_per_updates=500
@@ -37,9 +37,7 @@ export VIRTUAL_ENV=$REPO/.venv
 export PATH=$REPO/.venv/bin:\$PATH
 export PYTHONPATH=$REPO/src
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TOKENIZERS_PARALLELISM=false
 export PYTHONWARNINGS="ignore"
-export NUMBA_CACHE_DIR=/tmp/numba_cache_auk_init
 
 $REPO/.venv/bin/torchrun --nproc_per_node ${num_gpus} --nnodes 1 \\
   -m auk.train.distill.initializer.train \\

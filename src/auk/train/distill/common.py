@@ -8,15 +8,15 @@ from typing import Any, Literal, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from ema_pytorch import EMA
+from omegaconf import DictConfig, OmegaConf
+from safetensors.torch import load_file
 from torch import nn
-from transformers import Qwen2_5OmniProcessor
-from transformers.feature_extraction_utils import BatchFeature
+from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
 
 from auk.model.utils import lens_to_mask
-from auk.train.train import AukJsonlDataset
-
-
-WEIGHT_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+from auk.model.vae import load_vae_model
+from auk.model.vae.bigvgan_flow_vae import BigVGANFlowVAEConfig
 
 
 @dataclass
@@ -25,43 +25,9 @@ class DistillScriptArgs:
 
     train_jsonl: str
     config: str = "ckpts/AuK/config.yaml"
-    dataset_class: Literal["AukJsonlDataset", "AukJsonlDistillDataset"] = field(
-        default="AukJsonlDataset",
-        metadata={"help": "AukJsonlDistillDataset needs a 'task' field on every record."},
-    )
     teacher_ckpt: str = "ckpts/AuK/auk_base.safetensors"
     weight_type: Literal["bf16", "fp16", "fp32"] = "bf16"
     attn_backend: str = field(default="torch", metadata={"help": "Overrides model.arch.attn_backend."})
-
-
-class AukJsonlDistillDataset(AukJsonlDataset):
-    """AukJsonlDataset plus the per-record task label that task routing selects on."""
-
-    def __init__(self, jsonl_path: str, processor: Qwen2_5OmniProcessor):
-        super().__init__(jsonl_path, processor)
-        # Fail at startup: a guessed label would silently route the sample to the wrong objective.
-        missing = [index for index, row in enumerate(self.data) if "task" not in row]
-        if missing:
-            raise ValueError(
-                f"{jsonl_path}: {len(missing)} of {len(self.data)} records have no 'task' field "
-                f"(first at record {missing[0]}); task routing needs an explicit label on every record"
-            )
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        item = super().__getitem__(index)
-        item["task"] = self.data[index]["task"]
-        return item
-
-    def collate_fn(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        collated = super().collate_fn(batch)
-        collated["_tasks"] = [item["task"] for item in batch]
-        return collated
-
-
-def build_train_dataset(args: DistillScriptArgs, processor: Qwen2_5OmniProcessor) -> AukJsonlDataset:
-    if args.dataset_class == "AukJsonlDistillDataset":
-        return AukJsonlDistillDataset(args.train_jsonl, processor)
-    return AukJsonlDataset(args.train_jsonl, processor)
 
 
 @dataclass
@@ -76,65 +42,80 @@ class PreparedBatch:
     valid_mask: torch.Tensor
     ref_mask: torch.Tensor
     c_mask: torch.Tensor
-    metadata: Mapping[str, Any] | None = None
-
-    @classmethod
-    def from_tensors(
-        cls,
-        *,
-        clean: torch.Tensor,
-        ref: torch.Tensor,
-        text: torch.Tensor,
-        lens: torch.Tensor,
-        ref_lens: torch.Tensor,
-        c_mask: torch.Tensor,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> "PreparedBatch":
-        lens = lens.to(device=clean.device, dtype=torch.long)
-        ref_lens = ref_lens.to(device=clean.device, dtype=torch.long)
-        return cls(
-            clean=clean,
-            ref=ref,
-            text=text,
-            lens=lens,
-            ref_lens=ref_lens,
-            valid_mask=lens_to_mask(lens, length=clean.shape[1]),
-            ref_mask=lens_to_mask(ref_lens, length=ref.shape[1]),
-            c_mask=c_mask.to(device=clean.device, dtype=torch.bool),
-            metadata=None if metadata is None else dict(metadata),
-        )
+    tasks: Sequence[str | None] | None = None
 
     @property
     def loss_mask(self) -> torch.Tensor:
         return self.valid_mask.unsqueeze(-1)
 
-    def to(self, device: torch.device | str, *, dtype: torch.dtype | None = None) -> "PreparedBatch":
-        value_dtype = dtype or self.clean.dtype
-        return PreparedBatch(
-            clean=self.clean.to(device=device, dtype=value_dtype),
-            ref=self.ref.to(device=device, dtype=value_dtype),
-            text=self.text.to(device=device, dtype=value_dtype),
-            lens=self.lens.to(device=device),
-            ref_lens=self.ref_lens.to(device=device),
-            valid_mask=self.valid_mask.to(device=device),
-            ref_mask=self.ref_mask.to(device=device),
-            c_mask=self.c_mask.to(device=device),
-            metadata=self.metadata,
-        )
+
+def load_frozen_encoders(
+    model_config: DictConfig,
+) -> tuple[Qwen2_5OmniThinkerForConditionalGeneration, Qwen2_5OmniProcessor, nn.Module]:
+    """Return the frozen Qwen text encoder, its processor, and the frozen VAE."""
+    text_encoder_path = model_config.text_encoder.text_encoder_path
+    thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(text_encoder_path, torch_dtype=torch.bfloat16)
+    del thinker.visual
+    thinker.visual = None
+    thinker.eval().requires_grad_(False)
+    text_processor = Qwen2_5OmniProcessor.from_pretrained(text_encoder_path)
+
+    vae_config = model_config.vae
+    model_init_kwargs = OmegaConf.to_container(vae_config.get("model_init_kwargs", OmegaConf.create({})), resolve=True)
+    vae_model = load_vae_model(
+        vae_name=vae_config.vae_name,
+        vae_cfg=BigVGANFlowVAEConfig.from_dict(model_init_kwargs),
+        vae_ckpt=vae_config.vae_model_path,
+        map_location="cpu",
+    )
+    vae_model.eval().requires_grad_(False)
+    return thinker, text_processor, vae_model
 
 
-def task_selection_weight(batch: PreparedBatch, tasks: Sequence[str]) -> torch.Tensor:
-    """Per-sample 1.0 for the selected tasks, 0.0 otherwise."""
-    if batch.metadata is None:
-        raise ValueError("task selection is set but the batch carries no metadata; the dataloader must provide _tasks")
-    values = batch.metadata["_tasks"]
-    if len(values) != batch.clean.shape[0]:
-        raise ValueError(f"_tasks has {len(values)} entries for a batch of {batch.clean.shape[0]}")
-    selected = {str(task) for task in tasks}
-    return torch.tensor(
-        [1.0 if str(task) in selected else 0.0 for task in values],
-        device=batch.clean.device,
-        dtype=torch.float32,
+def load_teacher(path: str) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Return (backbone state, layer fusion) of a released AuK safetensors checkpoint."""
+    teacher_file = load_file(path)
+    backbone = {key.removeprefix("transformer."): value for key, value in teacher_file.items() if key.startswith("transformer.")}
+    fusion = {name: teacher_file[name] for name in ("layer_weights", "layer_scale")}
+    return backbone, fusion
+
+
+@torch.no_grad()
+def prepare_batch(
+    batch: Mapping[str, Any],
+    *,
+    vae_model: nn.Module,
+    text_encoder: nn.Module,
+    fusion: Mapping[str, torch.Tensor],
+    dtype: torch.dtype,
+) -> PreparedBatch:
+    """Encode each physical input once, with the checkpoint's fp32 layer fusion over the Qwen hidden states."""
+    device = next(vae_model.parameters()).device
+
+    clean, lens = vae_model.encoding_and_normalization(
+        batch["audio"].to(device), sample_lengths=batch["audio_lengths"].to(device=device, dtype=torch.long)
+    )
+    ref, ref_lens = vae_model.encoding_and_normalization(
+        batch["ref_audio"].to(device), sample_lengths=batch["ref_audio_lengths"].to(device=device, dtype=torch.long)
+    )
+
+    inputs = batch["cond_inputs"].to(device)
+    hidden_states = text_encoder(**inputs, output_hidden_states=True).hidden_states[1:]
+    width = hidden_states[0].shape[-1]
+    stacked = torch.stack([F.layer_norm(value, [width]) for value in hidden_states])
+    weights = F.softmax(fusion["layer_weights"], dim=0).to(stacked.dtype)
+    text = (stacked * weights[:, None, None, None]).sum(0) * fusion["layer_scale"].to(stacked.dtype)
+
+    return PreparedBatch(
+        clean=clean.to(dtype),
+        ref=ref.to(dtype),
+        text=text.to(dtype),
+        lens=lens,
+        ref_lens=ref_lens,
+        valid_mask=lens_to_mask(lens, length=clean.shape[1]),
+        ref_mask=lens_to_mask(ref_lens, length=ref.shape[1]),
+        c_mask=inputs["attention_mask"].bool(),
+        tasks=batch.get("_tasks"),
     )
 
 
@@ -152,19 +133,16 @@ def batch_time(time: torch.Tensor, batch_size: int, reference: torch.Tensor) -> 
     return time.to(device=reference.device, dtype=reference.dtype)
 
 
-def normal_like(value: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-    return torch.randn(value.shape, device=value.device, dtype=value.dtype, generator=generator)
-
-
-def add_velocity_noise(clean: torch.Tensor, noise: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+def add_noise(clean: torch.Tensor, noise: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
     """Linear flow interpolation with noise at t=0 and data at t=1."""
     expanded = expand_time(time, clean)
     return (1.0 - expanded) * noise + expanded * clean
 
 
-def velocity_to_clean(noisy: torch.Tensor, velocity: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
-    """Convert a velocity prediction to the implied clean endpoint."""
-    return noisy + (1.0 - expand_time(time, noisy)) * velocity
+def velocity_to_clean(noisy: torch.Tensor, velocity: torch.Tensor, time: torch.Tensor, batch: PreparedBatch) -> torch.Tensor:
+    """Clean endpoint implied by a velocity, with padded frames restored to the ground truth."""
+    clean = noisy + (1.0 - expand_time(time, noisy)) * velocity
+    return torch.where(batch.loss_mask, clean, batch.clean)
 
 
 def guided_velocity(conditional: torch.Tensor, unconditional: torch.Tensor, cfg_scale: float) -> torch.Tensor:
@@ -176,25 +154,8 @@ def guided_velocity(conditional: torch.Tensor, unconditional: torch.Tensor, cfg_
     return unconditional + cfg_scale * (conditional - unconditional)
 
 
-def clean_prediction(
-    noisy: torch.Tensor,
-    velocity: torch.Tensor,
-    time: torch.Tensor,
-    batch: PreparedBatch,
-) -> torch.Tensor:
-    """Clean endpoint of a velocity, with padded frames restored to the ground truth."""
-    clean = velocity_to_clean(noisy, velocity, time)
-    return torch.where(batch.valid_mask.unsqueeze(-1), clean, batch.clean)
-
-
-def predict_clean(
-    model: nn.Module,
-    noisy: torch.Tensor,
-    batch: PreparedBatch,
-    time: torch.Tensor,
-    *,
-    conditional: bool,
-) -> torch.Tensor:
+def predict_clean(model: nn.Module, noisy: torch.Tensor, batch: PreparedBatch, time: torch.Tensor) -> torch.Tensor:
+    """Fully conditioned clean prediction of one backbone."""
     velocity = model(
         x=noisy,
         text=batch.text,
@@ -203,83 +164,8 @@ def predict_clean(
         c_mask=batch.c_mask,
         ref=batch.ref,
         ref_mask=batch.ref_mask,
-        drop_audio_cond=not conditional,
-        drop_text=not conditional,
     )
-    return clean_prediction(noisy, velocity, time, batch)
-
-
-class FrozenQwenConditioner(nn.Module):
-    """One shared frozen Qwen pass with checkpoint-owned layer fusion."""
-
-    def __init__(self, *, text_encoder: nn.Module, layer_weights: torch.Tensor, layer_scale: torch.Tensor):
-        super().__init__()
-        self.text_encoder = text_encoder.eval().requires_grad_(False)
-        self.register_buffer("layer_weights", layer_weights.detach().float().clone(), persistent=True)
-        self.register_buffer("layer_scale", layer_scale.detach().float().clone(), persistent=True)
-
-    @torch.no_grad()
-    def forward(self, inputs: BatchFeature) -> tuple[torch.Tensor, torch.Tensor]:
-        inputs = inputs.to(next(self.text_encoder.parameters()).device)
-        attention_mask = inputs["attention_mask"]
-        outputs = self.text_encoder(**inputs, output_hidden_states=True)
-        hidden_states = list(outputs.hidden_states[1:])
-        if len(hidden_states) != self.layer_weights.numel():
-            raise ValueError(
-                f"text layer count does not match checkpoint fusion weights: {len(hidden_states)} != {self.layer_weights.numel()}"
-            )
-        width = hidden_states[0].shape[-1]
-        stacked = torch.stack([F.layer_norm(value, [width]) for value in hidden_states])
-        weights = F.softmax(self.layer_weights, dim=0).to(stacked.dtype)
-        fused = (stacked * weights[:, None, None, None]).sum(0) * self.layer_scale.to(stacked.dtype)
-        return fused.detach(), attention_mask.bool().detach()
-
-
-class VAEConditioningAdapter(nn.Module):
-    """Encode each physical input once and share it across all distillation roles."""
-
-    def __init__(self, *, vae_model: nn.Module, text_conditioner: FrozenQwenConditioner):
-        super().__init__()
-        self.vae_model = vae_model.eval().requires_grad_(False)
-        self.text_conditioner = text_conditioner.eval().requires_grad_(False)
-        self.latent_dim = int(vae_model.h.latent_dim)
-
-    @property
-    def device(self) -> torch.device:
-        return next(self.vae_model.parameters()).device
-
-    @torch.no_grad()
-    def encode_audio(self, audio: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if audio.shape[-1] == 0:
-            batch = audio.shape[0]
-            return (
-                torch.zeros(batch, 0, self.latent_dim, device=audio.device, dtype=torch.float32),
-                torch.zeros(batch, device=audio.device, dtype=torch.long),
-            )
-        return self.vae_model.encoding_and_normalization(audio, sample_lengths=lengths)
-
-    @torch.no_grad()
-    def prepare_batch(self, batch: Mapping[str, Any]) -> PreparedBatch:
-        device = self.device
-        clean, lens = self.encode_audio(
-            batch["audio"].to(device),
-            batch["audio_lengths"].to(device=device, dtype=torch.long),
-        )
-        ref, ref_lens = self.encode_audio(
-            batch["ref_audio"].to(device),
-            batch["ref_audio_lengths"].to(device=device, dtype=torch.long),
-        )
-        text, c_mask = self.text_conditioner(batch["cond_inputs"])
-        metadata = {"_tasks": batch["_tasks"]} if "_tasks" in batch else None
-        return PreparedBatch.from_tensors(
-            clean=clean.detach(),
-            ref=ref.detach(),
-            text=text.to(device).detach(),
-            lens=lens,
-            ref_lens=ref_lens,
-            c_mask=c_mask.to(device),
-            metadata=metadata,
-        )
+    return velocity_to_clean(noisy, velocity, time, batch)
 
 
 def reduce_metrics(
@@ -317,3 +203,21 @@ def reduce_metrics(
         for name, value in zip(names, stacked.tolist()):
             reduced[sum_keys[name] if reduction == "sum" else name] = float(value)
     return reduced
+
+
+def ema_to_inference_state(ema: EMA, fusion: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """EMA student in the layout AukInfer loads: CFMEdit keys under ema_model., plus EMA's initted/step."""
+    state = {key.replace("ema_model.", "ema_model.transformer.", 1): value for key, value in ema.state_dict().items()}
+    state.update({f"ema_model.{name}": value for name, value in fusion.items()})
+    return state
+
+
+def ema_from_inference_state(ema: EMA, state: Mapping[str, torch.Tensor]) -> None:
+    """Inverse of ema_to_inference_state; the layer fusion stays frozen, so its keys are dropped."""
+    ema.load_state_dict(
+        {
+            key.replace("ema_model.transformer.", "ema_model.", 1): value
+            for key, value in state.items()
+            if key.startswith("ema_model.transformer.") or key in ("initted", "step")
+        }
+    )

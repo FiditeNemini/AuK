@@ -3,57 +3,66 @@
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import torch
 from accelerate import Accelerator
 from ema_pytorch import EMA
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
+from torch import nn
+from torch.optim import AdamW
+from transformers import get_scheduler
 
-from auk.train.distill.common import PreparedBatch, VAEConditioningAdapter, reduce_metrics
-from auk.train.distill.dmd.checkpoint import load_training_checkpoint, save_training_checkpoint
-from auk.train.distill.dmd.system import DistillConfig, DMDEditSystem
-
-
-@dataclass
-class DMDUpdateState:
-    fake_score_updates: int = 0
-    student_updates: int = 0
-    fake_updates_since_student: int = 0
+from auk.train.distill.common import ema_from_inference_state, ema_to_inference_state, prepare_batch, reduce_metrics
+from auk.train.distill.dmd.system import DMDConfig, DMDSystem
 
 
-class DMDVAETrainer:
+class DMDTrainer:
     def __init__(
         self,
         *,
-        system: DMDEditSystem,
-        adapter: VAEConditioningAdapter,
-        student_optimizer: Optimizer,
-        fake_score_optimizer: Optimizer,
-        student_scheduler: LRScheduler,
-        fake_score_scheduler: LRScheduler,
-        time_grid: torch.Tensor,
-        config: DistillConfig,
+        system: DMDSystem,
+        vae_model: nn.Module,
+        text_encoder: nn.Module,
+        fusion: Mapping[str, torch.Tensor],
+        config: DMDConfig,
         resolved_config: Mapping[str, Any],
         accelerator: Accelerator,
     ):
         self.accelerator = accelerator
-        self.adapter = adapter.to(self.accelerator.device)
+        self.vae_model = vae_model.to(self.accelerator.device)
+        self.text_encoder = text_encoder.to(self.accelerator.device)
+        self.fusion = {name: value.float().to(self.accelerator.device) for name, value in fusion.items()}
+        self.resolved_config = dict(resolved_config)
+        self.student_update_interval = config.fake_score_updates_per_student
+        self.max_fake_score_updates = config.max_student_updates * config.fake_score_updates_per_student
+        self.max_grad_norm = config.max_grad_norm
+        self.fake_score_updates = 0
+        self.student_updates = 0
+        self.fake_updates_since_student = 0
+        self.epoch = 0
+
+        student_optimizer = AdamW(
+            system.student.parameters(), lr=config.student_learning_rate, betas=(0.9, 0.95), weight_decay=0.0
+        )
+        fake_score_optimizer = AdamW(
+            system.fake_score.parameters(), lr=config.fake_score_learning_rate, betas=(0.9, 0.95), weight_decay=0.0
+        )
+        self.student_scheduler = get_scheduler(
+            config.scheduler_type,
+            student_optimizer,
+            num_warmup_steps=config.warmup_updates,
+            num_training_steps=config.max_student_updates,
+        )
+        self.fake_score_scheduler = get_scheduler(
+            config.scheduler_type,
+            fake_score_optimizer,
+            num_warmup_steps=config.warmup_updates,
+            num_training_steps=self.max_fake_score_updates,
+        )
         self.system, self.student_optimizer, self.fake_score_optimizer = self.accelerator.prepare(
             system, student_optimizer, fake_score_optimizer
         )
-        self.student_scheduler = student_scheduler
-        self.fake_score_scheduler = fake_score_scheduler
-        self.time_grid = time_grid.to(device=self.accelerator.device, dtype=torch.float32)
-        self.resolved_config = dict(resolved_config)
-        self.student_update_interval = config.fake_score_updates_per_student
-        self.max_grad_norm = config.max_grad_norm
-        self.update_state = DMDUpdateState()
-        self.epoch = 0
-        self.batch_cursor = 0
         self.student_ema = EMA(
             system.student,
             beta=config.ema_beta,
@@ -62,56 +71,45 @@ class DMDVAETrainer:
             include_online_model=False,
         ).to(self.accelerator.device)
 
-    def step_generator(self, stream: int) -> torch.Generator:
-        # Prime strides keep every (update, rank, loss term) on distinct noise.
-        seed = (
-            1_000_003 * (self.update_state.fake_score_updates + 1)
-            + 97 * self.update_state.student_updates
-            + 10_000_019 * self.accelerator.process_index
-            + stream
-        )
-        return torch.Generator(device=self.accelerator.device).manual_seed(seed)
-
-    def step(self, prepared: PreparedBatch) -> dict[str, float]:
-        step_start = time.perf_counter()
-        self.system.train()
+    def step(self, batch: Mapping[str, Any]) -> dict[str, float]:
         unwrapped = self.accelerator.unwrap_model(self.system)
-        prepared = prepared.to(
-            self.accelerator.device,
+        prepared = prepare_batch(
+            batch,
+            vae_model=self.vae_model,
+            text_encoder=self.text_encoder,
+            fusion=self.fusion,
             dtype=next(unwrapped.student.parameters()).dtype,
         )
-        self.fake_score_optimizer.zero_grad(set_to_none=True)
-        fake_loss, metrics = self.system("fake_score", prepared, self.time_grid, self.step_generator(stream=1))
+        step_start = time.perf_counter()
+        self.system.train()
+        fake_loss, metrics = self.system("fake_score", prepared)
         self.accelerator.backward(fake_loss)
         fake_grad_norm = self.accelerator.clip_grad_norm_(unwrapped.fake_score.parameters(), self.max_grad_norm)
         self.fake_score_optimizer.step()
         self.fake_score_scheduler.step()
-        self.fake_score_optimizer.zero_grad(set_to_none=True)
-        self.update_state.fake_score_updates += 1
-        self.update_state.fake_updates_since_student += 1
+        self.fake_score_optimizer.zero_grad()
+        self.fake_score_updates += 1
+        self.fake_updates_since_student += 1
 
-        student_updated = self.update_state.fake_updates_since_student >= self.student_update_interval
+        student_updated = self.fake_updates_since_student >= self.student_update_interval
         if student_updated:
-            self.student_optimizer.zero_grad(set_to_none=True)
-            student_loss, student_metrics = self.system("student", prepared, self.time_grid, self.step_generator(stream=2))
+            student_loss, student_metrics = self.system("student", prepared)
             self.accelerator.backward(student_loss)
             student_grad_norm = self.accelerator.clip_grad_norm_(unwrapped.student.parameters(), self.max_grad_norm)
             self.student_optimizer.step()
             self.student_scheduler.step()
             self.student_ema.update()
-            self.student_optimizer.zero_grad(set_to_none=True)
-            self.update_state.student_updates += 1
-            self.update_state.fake_updates_since_student -= self.student_update_interval
+            self.student_optimizer.zero_grad()
+            self.student_updates += 1
+            self.fake_updates_since_student -= self.student_update_interval
             metrics.update(student_metrics)
             metrics["student_grad_norm"] = float(student_grad_norm.detach())
 
-        self.batch_cursor += 1
         metrics.update(
             {
                 "student_updated": float(student_updated),
-                "fake_score_updates": float(self.update_state.fake_score_updates),
-                "student_updates": float(self.update_state.student_updates),
-                "fake_updates_since_student": float(self.update_state.fake_updates_since_student),
+                "student_updates": float(self.student_updates),
+                "fake_updates_since_student": float(self.fake_updates_since_student),
                 "fake_score_grad_norm": float(fake_grad_norm.detach()),
                 "fake_score_lr": float(self.fake_score_scheduler.get_last_lr()[0]),
                 "student_lr": float(self.student_scheduler.get_last_lr()[0]),
@@ -136,32 +134,57 @@ class DMDVAETrainer:
             max_keys=("target_frames_max",),
         )
 
-    def save_checkpoint(self, path: Path) -> None:
-        save_training_checkpoint(
-            path,
-            accelerator=self.accelerator,
-            system=self.accelerator.unwrap_model(self.system),
-            student_optimizer=self.student_optimizer,
-            fake_score_optimizer=self.fake_score_optimizer,
-            student_scheduler=self.student_scheduler,
-            fake_score_scheduler=self.fake_score_scheduler,
-            student_ema_state=self.student_ema.ema_model.state_dict(),
-            update_state=asdict(self.update_state),
-            epoch=self.epoch,
-            batch_cursor=self.batch_cursor,
-            resolved_config=self.resolved_config,
-        )
+    def save_checkpoint(self, path: Path, *, with_training_state: bool) -> None:
+        """Write a file AukInfer loads directly; with_training_state adds what resuming needs."""
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            system = self.accelerator.unwrap_model(self.system)
+            checkpoint = {
+                "ema_model_state_dict": ema_to_inference_state(self.student_ema, self.fusion),
+                "update": self.student_updates,
+                "metadata": {
+                    "nfe": system.time_grid.numel() - 1,
+                    "time_grid": system.time_grid.tolist(),
+                    "resolved_config": self.resolved_config,
+                },
+            }
+            if with_training_state:
+                checkpoint.update(
+                    {
+                        "student_model_state_dict": system.student.state_dict(),
+                        "fake_score_model_state_dict": system.fake_score.state_dict(),
+                        "student_optimizer_state_dict": self.student_optimizer.state_dict(),
+                        "fake_score_optimizer_state_dict": self.fake_score_optimizer.state_dict(),
+                        "student_scheduler_state_dict": self.student_scheduler.state_dict(),
+                        "fake_score_scheduler_state_dict": self.fake_score_scheduler.state_dict(),
+                        "update_state": {
+                            "fake_score_updates": self.fake_score_updates,
+                            "student_updates": self.student_updates,
+                            "fake_updates_since_student": self.fake_updates_since_student,
+                        },
+                        "epoch": self.epoch,
+                    }
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Write-then-rename so a crash mid-write never leaves a truncated model_last.pt.
+            temporary = path.with_name(f".{path.name}.tmp")
+            self.accelerator.save(checkpoint, temporary)
+            temporary.replace(path)
+        self.accelerator.wait_for_everyone()
 
     def load_checkpoint(self, path: Path) -> None:
-        restored = load_training_checkpoint(
-            torch.load(path, map_location="cpu", weights_only=True),
-            system=self.accelerator.unwrap_model(self.system),
-            student_optimizer=self.student_optimizer,
-            fake_score_optimizer=self.fake_score_optimizer,
-            student_scheduler=self.student_scheduler,
-            fake_score_scheduler=self.fake_score_scheduler,
-        )
-        self.student_ema.ema_model.load_state_dict(restored["student_ema_state"], strict=True)
-        self.update_state = DMDUpdateState(**restored["update_state"])
-        self.epoch = restored["epoch"]
-        self.batch_cursor = restored["batch_cursor"]
+        """Restore a file written by save_checkpoint(with_training_state=True)."""
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        system = self.accelerator.unwrap_model(self.system)
+        system.student.load_state_dict(checkpoint["student_model_state_dict"])
+        system.fake_score.load_state_dict(checkpoint["fake_score_model_state_dict"])
+        self.student_optimizer.load_state_dict(checkpoint["student_optimizer_state_dict"])
+        self.fake_score_optimizer.load_state_dict(checkpoint["fake_score_optimizer_state_dict"])
+        self.student_scheduler.load_state_dict(checkpoint["student_scheduler_state_dict"])
+        self.fake_score_scheduler.load_state_dict(checkpoint["fake_score_scheduler_state_dict"])
+        ema_from_inference_state(self.student_ema, checkpoint["ema_model_state_dict"])
+        update_state = checkpoint["update_state"]
+        self.fake_score_updates = update_state["fake_score_updates"]
+        self.student_updates = update_state["student_updates"]
+        self.fake_updates_since_student = update_state["fake_updates_since_student"]
+        self.epoch = checkpoint["epoch"]
