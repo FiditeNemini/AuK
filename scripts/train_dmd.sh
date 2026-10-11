@@ -14,7 +14,7 @@ initialized_student_path=""
 num_gpus=8
 attn_backend=torch
 
-# DistillConfig
+# DMDConfig
 max_student_updates=2500
 frames_threshold=10000
 max_samples=24

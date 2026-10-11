@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 from torch import nn
 
+from auk.model import CFMEdit
 from auk.train.distill.common import (
     PreparedBatch,
     add_noise,
@@ -23,7 +24,7 @@ class InitConfig:
     """Initializer hyper-parameters."""
 
     eps: float = 1.0e-5
-    max_updates: int = 500  # measured as the point where CM loss flattens
+    max_updates: int = 500
     learning_rate: float = 1.0e-5
     scheduler_type: str = "constant"
     warmup_updates: int = 0
@@ -59,14 +60,9 @@ class InitConfig:
 
 
 class ConsistencyInitSystem(nn.Module):
-    """Stage-one objective: pull the student towards a few-step solution.
+    """Stage-one objective: pull the student towards a few-step solution."""
 
-    The student's clean prediction at current is regressed onto its own
-    prediction at endpoint, so the two collapse onto one consistent
-    trajectory before DMD starts.
-    """
-
-    def __init__(self, *, student: nn.Module, teacher: nn.Module, config: InitConfig):
+    def __init__(self, *, student: CFMEdit, teacher: CFMEdit, config: InitConfig):
         super().__init__()
         self.student = student
         self.teacher = teacher.eval().requires_grad_(False)
@@ -74,7 +70,6 @@ class ConsistencyInitSystem(nn.Module):
         self.eps = config.eps
 
     def train(self, mode: bool = True) -> "ConsistencyInitSystem":
-        # nn.Module.train recurses into children; the teacher has dropout and must stay in eval.
         super().train(mode)
         self.teacher.eval()
         return self
@@ -88,7 +83,7 @@ class ConsistencyInitSystem(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
         """Sample the (current, endpoint) time pair on the staged shrink schedule.
 
-        The schedule is defined on noise levels (1 = pure noise); they are flipped to flow time on return.
+        The schedule is defined on noise levels (1 = pure noise).
         """
         config = self.config
         normal = torch.randn(batch.clean.shape[0], device=batch.clean.device, dtype=batch.clean.dtype)
@@ -96,6 +91,8 @@ class ConsistencyInitSystem(nn.Module):
         current_noise_level = current_noise_level * (config.max_time - config.min_time) + config.min_time
         stage = (iteration + config.ct_resume_updates) * global_batch_size // (config.ct_kimg_per_stage * 1000)
         ratio = min(1.0 - 1.0 / config.ct_q ** (stage + 1), config.ct_ratio_limit)
+        # 8.0 is the empirical constant of the ECT sigmoid time gap (https://github.com/locuslab/ect),
+        # carried over verbatim from FastGen CM.py t_to_r_sigmoid.
         endpoint_noise_level = current_noise_level - current_noise_level * (1.0 - ratio) * (
             1.0 + 8.0 * torch.sigmoid(-current_noise_level)
         )
@@ -149,7 +146,7 @@ class ConsistencyInitSystem(nn.Module):
         noisy_current = add_noise(batch.clean, noise, current)
         if config.use_cd:
             with torch.no_grad():
-                conditional, unconditional = self.teacher(
+                conditional, unconditional = self.teacher.transformer(
                     x=noisy_current,
                     text=batch.text,
                     time=batch_time(current, noisy_current.shape[0], noisy_current),
@@ -167,13 +164,12 @@ class ConsistencyInitSystem(nn.Module):
         # Both student passes must see the same dropout draw, otherwise the pair
         # differs by dropout noise rather than by the time step alone.
         with torch.random.fork_rng(devices=[noisy_current.device]):
-            prediction = predict_clean(self.student, noisy_current, batch, current)
+            prediction = predict_clean(self.student.transformer, noisy_current, batch, current)
         with torch.no_grad():
-            target = predict_clean(self.student, noisy_endpoint, batch, endpoint)
+            target = predict_clean(self.student.transformer, noisy_endpoint, batch, endpoint)
         per_sample, unweighted = self.cm_distance(prediction, target, batch, current, endpoint)
 
-        # Divide by a device tensor: CUDA turns a Python-scalar divisor into a reciprocal multiply, which moves the last bit.
-        total = per_sample.sum() / per_sample.new_tensor(per_sample.shape[0])
+        total = per_sample.sum() / per_sample.shape[0]
         return total, {
             "current_time": float(current.mean()),
             "endpoint_time": float(endpoint.mean()),

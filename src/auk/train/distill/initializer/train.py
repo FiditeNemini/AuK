@@ -14,11 +14,14 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs
 from omegaconf import OmegaConf
+from safetensors.torch import load_file
 from torch.utils.data import DataLoader, SequentialSampler
-from transformers import HfArgumentParser
+from transformers import HfArgumentParser, Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
 
-from auk.model import Flux2Edit
-from auk.train.distill.common import DistillScriptArgs, load_frozen_encoders, load_teacher
+from auk.model import CFMEdit, Flux2Edit
+from auk.model.vae import load_vae_model
+from auk.model.vae.bigvgan_flow_vae import BigVGANFlowVAEConfig
+from auk.train.distill.common import DistillScriptArgs
 from auk.train.distill.initializer.consistency import ConsistencyInitSystem, InitConfig
 from auk.train.distill.initializer.trainer import InitializerTrainer
 from auk.train.train import AukJsonlDataset, DynamicBatchSampler
@@ -48,30 +51,60 @@ def main() -> None:
         os.makedirs(args.output_dir, exist_ok=True)
         shutil.copy(args.config, saved_config)
 
-    logger.info("Loading Qwen text encoder and VAE ...")
-    thinker, text_processor, vae_model = load_frozen_encoders(model_config)
+    text_encoder_config = model_config.text_encoder
+    vae_config = model_config.vae
 
-    logger.info("Building student / teacher backbones ...")
-    arch = OmegaConf.to_container(model_config.arch, resolve=True)
-    arch["attn_backend"] = args.attn_backend
-    latent_dim = model_config.vae.latent_dim
-    system = ConsistencyInitSystem(
-        student=Flux2Edit(**arch, latent_dim=latent_dim),
-        teacher=Flux2Edit(**arch, latent_dim=latent_dim),
-        config=init_config,
+    logger.info(f"Loading Qwen text encoder from {text_encoder_config.text_encoder_path} ...")
+    thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+        text_encoder_config.text_encoder_path, torch_dtype=torch.bfloat16
     )
+    del thinker.visual
+    thinker.visual = None
+    text_processor = Qwen2_5OmniProcessor.from_pretrained(text_encoder_config.text_encoder_path)
+
+    logger.info(f"Loading VAE from {vae_config.vae_model_path} ...")
+    model_init_kwargs = OmegaConf.to_container(vae_config.get("model_init_kwargs", OmegaConf.create({})), resolve=True)
+    vae_model = load_vae_model(
+        vae_name=vae_config.vae_name,
+        vae_cfg=BigVGANFlowVAEConfig.from_dict(model_init_kwargs),
+        vae_ckpt=vae_config.vae_model_path,
+        map_location="cpu",
+    )
+    vae_model.eval()
+    vae_model.requires_grad_(False)
+
+    logger.info("Building student / teacher CFMEdit models around one shared Qwen ...")
+    model_arc = OmegaConf.to_container(model_config.arch, resolve=True)
+    model_arc["attn_backend"] = args.attn_backend
+    schedule_config = OmegaConf.to_container(model_config.get("schedule", OmegaConf.create({})), resolve=True)
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.weight_type]
+    student, teacher = (
+        CFMEdit(
+            transformer=Flux2Edit(**model_arc, latent_dim=vae_config.latent_dim).to(dtype),
+            text_encoder=thinker,
+            text_processor=text_processor,
+            num_channels=vae_config.latent_dim,
+            **schedule_config,
+        )
+        for _ in range(2)
+    )
+    for model in (student, teacher):
+        # Text is encoded once without grad for every role, so the fp32 layer fusion stays at the teacher values.
+        model.layer_weights.requires_grad_(False)
+        model.layer_scale.requires_grad_(False)
 
     logger.info(f"Loading teacher weights from {args.teacher_ckpt} ...")
-    teacher_state, fusion = load_teacher(args.teacher_ckpt)
-    system.teacher.load_state_dict(teacher_state)
-    system.student.load_state_dict(teacher_state)
-    system = system.to(dtype={"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.weight_type])
+    teacher_state = load_file(args.teacher_ckpt)
+    for role, model in (("teacher", teacher), ("student", student)):
+        # text_encoder.* is never saved; it comes from the Qwen snapshot.
+        missing, unexpected = model.load_state_dict(teacher_state, strict=False)
+        missing = [key for key in missing if "text_encoder." not in key]
+        if missing or unexpected:
+            raise RuntimeError(f"{role}: {len(missing)} missing {missing[:5]}, {len(unexpected)} unexpected {unexpected[:5]}")
 
     trainer = InitializerTrainer(
-        system=system,
+        system=ConsistencyInitSystem(student=student, teacher=teacher, config=init_config),
         vae_model=vae_model,
-        text_encoder=thinker,
-        fusion=fusion,
         config=init_config,
         resolved_config={"initializer": asdict(init_config), "script_args": asdict(args)},
         accelerator=accelerator,

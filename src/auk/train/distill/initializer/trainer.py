@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -11,7 +12,7 @@ from torch import nn
 from torch.optim import AdamW
 from transformers import get_scheduler
 
-from auk.train.distill.common import ema_from_inference_state, ema_to_inference_state, prepare_batch, reduce_metrics
+from auk.train.distill.common import prepare_batch, reduce_metrics
 from auk.train.distill.initializer.consistency import ConsistencyInitSystem, InitConfig
 
 
@@ -21,22 +22,18 @@ class InitializerTrainer:
         *,
         system: ConsistencyInitSystem,
         vae_model: nn.Module,
-        text_encoder: nn.Module,
-        fusion: Mapping[str, torch.Tensor],
         config: InitConfig,
         resolved_config: Mapping[str, Any],
         accelerator: Accelerator,
     ):
         self.accelerator = accelerator
         self.vae_model = vae_model.to(self.accelerator.device)
-        self.text_encoder = text_encoder.to(self.accelerator.device)
-        self.fusion = {name: value.float().to(self.accelerator.device) for name, value in fusion.items()}
         self.resolved_config = dict(resolved_config)
         self.max_grad_norm = config.max_grad_norm
         self.updates = 0
         self.epoch = 0
 
-        optimizer = AdamW(system.student.parameters(), lr=config.learning_rate, betas=(0.9, 0.95), weight_decay=0.0)
+        optimizer = AdamW(system.student.transformer.parameters(), lr=config.learning_rate, betas=(0.9, 0.95), weight_decay=0.0)
         self.scheduler = get_scheduler(
             config.scheduler_type,
             optimizer,
@@ -44,21 +41,24 @@ class InitializerTrainer:
             num_training_steps=config.max_updates,
         )
         self.system, self.optimizer = self.accelerator.prepare(system, optimizer)
+        # EMA of the whole student CFMEdit, sharing its frozen Qwen instead of copying it.
         self.student_ema = EMA(
             system.student,
+            ema_model=copy.deepcopy(system.student, memo={id(system.student.text_encoder): system.student.text_encoder}),
             beta=config.ema_beta,
             update_after_step=config.ema_update_after_step,
             update_every=config.ema_update_every,
             include_online_model=False,
+            ignore_startswith_names={"text_encoder."},
         ).to(self.accelerator.device)
 
     def step(self, batch: Mapping[str, Any]) -> dict[str, float]:
-        student = self.accelerator.unwrap_model(self.system).student
+        system = self.accelerator.unwrap_model(self.system)
+        student = system.student.transformer
         prepared = prepare_batch(
             batch,
             vae_model=self.vae_model,
-            text_encoder=self.text_encoder,
-            fusion=self.fusion,
+            text_model=system.teacher,
             dtype=next(student.parameters()).dtype,
         )
         step_start = time.perf_counter()
@@ -94,14 +94,15 @@ class InitializerTrainer:
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             checkpoint = {
-                "ema_model_state_dict": ema_to_inference_state(self.student_ema, self.fusion),
+                "ema_model_state_dict": {k: v for k, v in self.student_ema.state_dict().items() if "text_encoder." not in k},
                 "update": self.updates,
                 "metadata": {"resolved_config": self.resolved_config},
             }
             if with_training_state:
+                student = self.accelerator.unwrap_model(self.system).student
                 checkpoint.update(
                     {
-                        "student_model_state_dict": self.accelerator.unwrap_model(self.system).student.state_dict(),
+                        "student_model_state_dict": {k: v for k, v in student.state_dict().items() if "text_encoder." not in k},
                         "optimizer_state_dict": self.optimizer.state_dict(),
                         "scheduler_state_dict": self.scheduler.state_dict(),
                         "epoch": self.epoch,
@@ -117,9 +118,13 @@ class InitializerTrainer:
     def load_checkpoint(self, path: Path) -> None:
         """Restore a file written by save_checkpoint(with_training_state=True)."""
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        self.accelerator.unwrap_model(self.system).student.load_state_dict(checkpoint["student_model_state_dict"])
+        student = self.accelerator.unwrap_model(self.system).student
+        for module, key in ((student, "student_model_state_dict"), (self.student_ema, "ema_model_state_dict")):
+            missing, unexpected = module.load_state_dict(checkpoint[key], strict=False)
+            missing = [name for name in missing if "text_encoder." not in name]
+            if missing or unexpected:
+                raise RuntimeError(f"{key}: {len(missing)} missing {missing[:5]}, {len(unexpected)} unexpected {unexpected[:5]}")
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        ema_from_inference_state(self.student_ema, checkpoint["ema_model_state_dict"])
         self.updates = checkpoint["update"]
         self.epoch = checkpoint["epoch"]

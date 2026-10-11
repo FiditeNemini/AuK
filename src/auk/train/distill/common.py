@@ -6,17 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
-from ema_pytorch import EMA
-from omegaconf import DictConfig, OmegaConf
-from safetensors.torch import load_file
 from torch import nn
-from transformers import Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
 
+from auk.model import CFMEdit
 from auk.model.utils import lens_to_mask
-from auk.model.vae import load_vae_model
-from auk.model.vae.bigvgan_flow_vae import BigVGANFlowVAEConfig
 
 
 @dataclass
@@ -49,47 +43,15 @@ class PreparedBatch:
         return self.valid_mask.unsqueeze(-1)
 
 
-def load_frozen_encoders(
-    model_config: DictConfig,
-) -> tuple[Qwen2_5OmniThinkerForConditionalGeneration, Qwen2_5OmniProcessor, nn.Module]:
-    """Return the frozen Qwen text encoder, its processor, and the frozen VAE."""
-    text_encoder_path = model_config.text_encoder.text_encoder_path
-    thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(text_encoder_path, torch_dtype=torch.bfloat16)
-    del thinker.visual
-    thinker.visual = None
-    thinker.eval().requires_grad_(False)
-    text_processor = Qwen2_5OmniProcessor.from_pretrained(text_encoder_path)
-
-    vae_config = model_config.vae
-    model_init_kwargs = OmegaConf.to_container(vae_config.get("model_init_kwargs", OmegaConf.create({})), resolve=True)
-    vae_model = load_vae_model(
-        vae_name=vae_config.vae_name,
-        vae_cfg=BigVGANFlowVAEConfig.from_dict(model_init_kwargs),
-        vae_ckpt=vae_config.vae_model_path,
-        map_location="cpu",
-    )
-    vae_model.eval().requires_grad_(False)
-    return thinker, text_processor, vae_model
-
-
-def load_teacher(path: str) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """Return (backbone state, layer fusion) of a released AuK safetensors checkpoint."""
-    teacher_file = load_file(path)
-    backbone = {key.removeprefix("transformer."): value for key, value in teacher_file.items() if key.startswith("transformer.")}
-    fusion = {name: teacher_file[name] for name in ("layer_weights", "layer_scale")}
-    return backbone, fusion
-
-
 @torch.no_grad()
 def prepare_batch(
     batch: Mapping[str, Any],
     *,
     vae_model: nn.Module,
-    text_encoder: nn.Module,
-    fusion: Mapping[str, torch.Tensor],
+    text_model: CFMEdit,
     dtype: torch.dtype,
 ) -> PreparedBatch:
-    """Encode each physical input once, with the checkpoint's fp32 layer fusion over the Qwen hidden states."""
+    """Encode each physical input once; the text goes through text_model.encode_text."""
     device = next(vae_model.parameters()).device
 
     clean, lens = vae_model.encoding_and_normalization(
@@ -98,13 +60,7 @@ def prepare_batch(
     ref, ref_lens = vae_model.encoding_and_normalization(
         batch["ref_audio"].to(device), sample_lengths=batch["ref_audio_lengths"].to(device=device, dtype=torch.long)
     )
-
-    inputs = batch["cond_inputs"].to(device)
-    hidden_states = text_encoder(**inputs, output_hidden_states=True).hidden_states[1:]
-    width = hidden_states[0].shape[-1]
-    stacked = torch.stack([F.layer_norm(value, [width]) for value in hidden_states])
-    weights = F.softmax(fusion["layer_weights"], dim=0).to(stacked.dtype)
-    text = (stacked * weights[:, None, None, None]).sum(0) * fusion["layer_scale"].to(stacked.dtype)
+    text, c_mask = text_model.encode_text(batch["cond_inputs"], device)
 
     return PreparedBatch(
         clean=clean.to(dtype),
@@ -114,7 +70,7 @@ def prepare_batch(
         ref_lens=ref_lens,
         valid_mask=lens_to_mask(lens, length=clean.shape[1]),
         ref_mask=lens_to_mask(ref_lens, length=ref.shape[1]),
-        c_mask=inputs["attention_mask"].bool(),
+        c_mask=c_mask,
         tasks=batch.get("_tasks"),
     )
 
@@ -154,9 +110,9 @@ def guided_velocity(conditional: torch.Tensor, unconditional: torch.Tensor, cfg_
     return unconditional + cfg_scale * (conditional - unconditional)
 
 
-def predict_clean(model: nn.Module, noisy: torch.Tensor, batch: PreparedBatch, time: torch.Tensor) -> torch.Tensor:
+def predict_clean(backbone: nn.Module, noisy: torch.Tensor, batch: PreparedBatch, time: torch.Tensor) -> torch.Tensor:
     """Fully conditioned clean prediction of one backbone."""
-    velocity = model(
+    velocity = backbone(
         x=noisy,
         text=batch.text,
         time=batch_time(time, noisy.shape[0], noisy),
@@ -203,21 +159,3 @@ def reduce_metrics(
         for name, value in zip(names, stacked.tolist()):
             reduced[sum_keys[name] if reduction == "sum" else name] = float(value)
     return reduced
-
-
-def ema_to_inference_state(ema: EMA, fusion: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """EMA student in the layout AukInfer loads: CFMEdit keys under ema_model., plus EMA's initted/step."""
-    state = {key.replace("ema_model.", "ema_model.transformer.", 1): value for key, value in ema.state_dict().items()}
-    state.update({f"ema_model.{name}": value for name, value in fusion.items()})
-    return state
-
-
-def ema_from_inference_state(ema: EMA, state: Mapping[str, torch.Tensor]) -> None:
-    """Inverse of ema_to_inference_state; the layer fusion stays frozen, so its keys are dropped."""
-    ema.load_state_dict(
-        {
-            key.replace("ema_model.transformer.", "ema_model.", 1): value
-            for key, value in state.items()
-            if key.startswith("ema_model.transformer.") or key in ("initted", "step")
-        }
-    )

@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 from torch import nn
 
+from auk.model import CFMEdit
 from auk.train.distill.common import (
     PreparedBatch,
     add_noise,
@@ -112,7 +113,7 @@ def sample_decoupled_time(
 
 
 class DMDSystem(nn.Module):
-    def __init__(self, *, student: nn.Module, teacher: nn.Module, fake_score: nn.Module, config: DMDConfig):
+    def __init__(self, *, student: CFMEdit, teacher: CFMEdit, fake_score: CFMEdit, config: DMDConfig):
         super().__init__()
         self.student = student
         self.teacher = teacher.eval().requires_grad_(False)
@@ -122,12 +123,11 @@ class DMDSystem(nn.Module):
         self.regression_only_tasks = (
             tuple(task.strip() for task in config.regression_only_tasks.split(",") if task.strip()) if config.task_routing else ()
         )
-        # Plain fp32 attribute, not a buffer: system.to(dtype=bf16) would cast a buffer.
         time_grid = torch.linspace(0, 1, config.nfe + 1)
         self.time_grid = time_grid + config.sway_sampling_coef * (torch.cos(torch.pi / 2 * time_grid) - 1 + time_grid)
 
     def train(self, mode: bool = True) -> "DMDSystem":
-        # nn.Module.train recurses into children; the teacher has dropout and must stay in eval.
+        # nn.Module.train recurses into children; the teacher has dropout and, like the Qwen all roles share, must stay in eval.
         super().train(mode)
         self.teacher.eval()
         return self
@@ -168,7 +168,7 @@ class DMDSystem(nn.Module):
             with torch.no_grad():
                 for index in range(step_index):
                     step_time = time_grid[index : index + 1]
-                    velocity = self.student(
+                    velocity = self.student.transformer(
                         x=current,
                         text=batch.text,
                         time=batch_time(step_time, current.shape[0], current),
@@ -180,7 +180,7 @@ class DMDSystem(nn.Module):
                     current = (current + (time_grid[index + 1] - time_grid[index]) * velocity) * batch.loss_mask
 
         with torch.set_grad_enabled(with_grad):
-            clean = predict_clean(self.student, current, batch, selected_time)
+            clean = predict_clean(self.student.transformer, current, batch, selected_time)
         return clean, selected_time
 
     def fake_score_loss(self, batch: PreparedBatch) -> tuple[torch.Tensor, dict[str, float]]:
@@ -188,7 +188,7 @@ class DMDSystem(nn.Module):
         time = torch.rand((batch.clean.shape[0],), device=batch.clean.device, dtype=batch.clean.dtype)
         noise = torch.randn_like(rollout_clean)
         noisy = add_noise(rollout_clean, noise, time)
-        prediction = self.fake_score(
+        prediction = self.fake_score.transformer(
             x=noisy,
             text=batch.text,
             time=batch_time(time, noisy.shape[0], noisy),
@@ -214,8 +214,8 @@ class DMDSystem(nn.Module):
         time = sample_decoupled_time(batch, schedule=self.config.dm_time_schedule)
         noise = torch.randn_like(detached_clean)
         noisy = add_noise(detached_clean, noise, time)
-        fake_clean = predict_clean(self.fake_score, noisy, batch, time)
-        teacher_cond_clean = predict_clean(self.teacher, noisy, batch, time)
+        fake_clean = predict_clean(self.fake_score.transformer, noisy, batch, time)
+        teacher_cond_clean = predict_clean(self.teacher.transformer, noisy, batch, time)
         return fake_clean - teacher_cond_clean, teacher_cond_clean, time
 
     def ca_gradient_term(
@@ -229,7 +229,7 @@ class DMDSystem(nn.Module):
         time = sample_decoupled_time(batch, schedule=config.ca_time_schedule, lower_bound=rollout_time)
         noise = torch.randn_like(detached_clean)
         noisy = add_noise(detached_clean, noise, time)
-        conditional, unconditional = self.teacher(
+        conditional, unconditional = self.teacher.transformer(
             x=noisy,
             text=batch.text,
             time=batch_time(time, noisy.shape[0], noisy),
