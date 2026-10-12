@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 import torch
 from accelerate import Accelerator
+from accelerate.logging import get_logger
 from ema_pytorch import EMA
 from torch import nn
 from torch.optim import AdamW
@@ -16,6 +17,9 @@ from transformers import get_scheduler
 
 from auk.train.distill.common import prepare_batch, reduce_metrics
 from auk.train.distill.dmd.system import DMDConfig, DMDSystem
+
+
+logger = get_logger(__name__)
 
 
 class DMDTrainer:
@@ -134,49 +138,45 @@ class DMDTrainer:
         )
 
     def save_checkpoint(self, path: Path, *, with_training_state: bool) -> None:
-        """Write a file AukInfer loads directly; with_training_state adds what resuming needs."""
         self.accelerator.wait_for_everyone()
-        if self.accelerator.is_main_process:
-            system = self.accelerator.unwrap_model(self.system)
-            checkpoint = {
-                "ema_model_state_dict": {k: v for k, v in self.student_ema.state_dict().items() if "text_encoder." not in k},
-                "update": self.student_updates,
-                "metadata": {
-                    "nfe": system.time_grid.numel() - 1,
-                    "time_grid": system.time_grid.tolist(),
-                    "resolved_config": self.resolved_config,
-                },
-            }
-            if with_training_state:
-                checkpoint.update(
-                    {
-                        "student_model_state_dict": {
-                            k: v for k, v in system.student.state_dict().items() if "text_encoder." not in k
-                        },
-                        "fake_score_model_state_dict": {
-                            k: v for k, v in system.fake_score.state_dict().items() if "text_encoder." not in k
-                        },
-                        "student_optimizer_state_dict": self.student_optimizer.state_dict(),
-                        "fake_score_optimizer_state_dict": self.fake_score_optimizer.state_dict(),
-                        "student_scheduler_state_dict": self.student_scheduler.state_dict(),
-                        "fake_score_scheduler_state_dict": self.fake_score_scheduler.state_dict(),
-                        "update_state": {
-                            "fake_score_updates": self.fake_score_updates,
-                            "student_updates": self.student_updates,
-                            "fake_updates_since_student": self.fake_updates_since_student,
-                        },
-                        "epoch": self.epoch,
-                    }
-                )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # Write-then-rename so a crash mid-write never leaves a truncated model_last.pt.
-            temporary = path.with_name(f".{path.name}.tmp")
-            self.accelerator.save(checkpoint, temporary)
-            temporary.replace(path)
-        self.accelerator.wait_for_everyone()
+        if not self.accelerator.is_main_process:
+            return
+        system = self.accelerator.unwrap_model(self.system)
+        checkpoint = {
+            "ema_model_state_dict": {k: v for k, v in self.student_ema.state_dict().items() if "text_encoder." not in k},
+            "update": self.student_updates,
+            "metadata": {
+                "nfe": system.time_grid.numel() - 1,
+                "time_grid": system.time_grid.tolist(),
+                "resolved_config": self.resolved_config,
+            },
+        }
+        if with_training_state:
+            checkpoint.update(
+                {
+                    "student_model_state_dict": {
+                        k: v for k, v in system.student.state_dict().items() if "text_encoder." not in k
+                    },
+                    "fake_score_model_state_dict": {
+                        k: v for k, v in system.fake_score.state_dict().items() if "text_encoder." not in k
+                    },
+                    "student_optimizer_state_dict": self.student_optimizer.state_dict(),
+                    "fake_score_optimizer_state_dict": self.fake_score_optimizer.state_dict(),
+                    "student_scheduler_state_dict": self.student_scheduler.state_dict(),
+                    "fake_score_scheduler_state_dict": self.fake_score_scheduler.state_dict(),
+                    "update_state": {
+                        "fake_score_updates": self.fake_score_updates,
+                        "student_updates": self.student_updates,
+                        "fake_updates_since_student": self.fake_updates_since_student,
+                    },
+                    "epoch": self.epoch,
+                }
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.accelerator.save(checkpoint, path)
+        logger.info(f"saved {path} | student_update={self.student_updates}")
 
     def load_checkpoint(self, path: Path) -> None:
-        """Restore a file written by save_checkpoint(with_training_state=True)."""
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         system = self.accelerator.unwrap_model(self.system)
         for module, key in (

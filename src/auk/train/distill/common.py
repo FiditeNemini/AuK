@@ -51,14 +51,14 @@ def prepare_batch(
     text_model: CFMEdit,
     dtype: torch.dtype,
 ) -> PreparedBatch:
-    """Encode each physical input once; the text goes through text_model.encode_text."""
+    """Encode each physical input once."""
     device = next(vae_model.parameters()).device
 
     clean, lens = vae_model.encoding_and_normalization(
-        batch["audio"].to(device), sample_lengths=batch["audio_lengths"].to(device=device, dtype=torch.long)
+        batch["audio"].to(device), sample_lengths=batch["audio_lengths"].to(device)
     )
     ref, ref_lens = vae_model.encoding_and_normalization(
-        batch["ref_audio"].to(device), sample_lengths=batch["ref_audio_lengths"].to(device=device, dtype=torch.long)
+        batch["ref_audio"].to(device), sample_lengths=batch["ref_audio_lengths"].to(device)
     )
     text, c_mask = text_model.encode_text(batch["cond_inputs"], device)
 
@@ -75,29 +75,15 @@ def prepare_batch(
     )
 
 
-def expand_time(time: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    while time.ndim < target.ndim:
-        time = time.unsqueeze(-1)
-    return time.to(device=target.device, dtype=target.dtype)
-
-
-def batch_time(time: torch.Tensor, batch_size: int, reference: torch.Tensor) -> torch.Tensor:
-    if time.ndim == 0:
-        time = time[None]
-    if time.numel() == 1:
-        time = time.expand(batch_size)
-    return time.to(device=reference.device, dtype=reference.dtype)
-
-
 def add_noise(clean: torch.Tensor, noise: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
     """Linear flow interpolation with noise at t=0 and data at t=1."""
-    expanded = expand_time(time, clean)
+    expanded = time[:, None, None].to(clean.dtype)
     return (1.0 - expanded) * noise + expanded * clean
 
 
 def velocity_to_clean(noisy: torch.Tensor, velocity: torch.Tensor, time: torch.Tensor, batch: PreparedBatch) -> torch.Tensor:
     """Clean endpoint implied by a velocity, with padded frames restored to the ground truth."""
-    clean = noisy + (1.0 - expand_time(time, noisy)) * velocity
+    clean = noisy + (1.0 - time[:, None, None].to(noisy.dtype)) * velocity
     return torch.where(batch.loss_mask, clean, batch.clean)
 
 
@@ -115,7 +101,7 @@ def predict_clean(backbone: nn.Module, noisy: torch.Tensor, batch: PreparedBatch
     velocity = backbone(
         x=noisy,
         text=batch.text,
-        time=batch_time(time, noisy.shape[0], noisy),
+        time=time.expand(noisy.shape[0]).to(noisy.dtype),
         mask=batch.valid_mask,
         c_mask=batch.c_mask,
         ref=batch.ref,

@@ -42,8 +42,6 @@ def main() -> None:
     args, init_config = parser.parse_args_into_dataclasses()
     accelerator = Accelerator(kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
 
-    torch.manual_seed(init_config.seed)
-
     model_config = OmegaConf.load(args.config).model
 
     saved_config = os.path.join(args.output_dir, "config.yaml")
@@ -51,6 +49,7 @@ def main() -> None:
         os.makedirs(args.output_dir, exist_ok=True)
         shutil.copy(args.config, saved_config)
 
+    # loading models
     text_encoder_config = model_config.text_encoder
     vae_config = model_config.vae
 
@@ -89,19 +88,18 @@ def main() -> None:
         for _ in range(2)
     )
     for model in (student, teacher):
-        # Text is encoded once without grad for every role, so the fp32 layer fusion stays at the teacher values.
         model.layer_weights.requires_grad_(False)
         model.layer_scale.requires_grad_(False)
 
     logger.info(f"Loading teacher weights from {args.teacher_ckpt} ...")
     teacher_state = load_file(args.teacher_ckpt)
     for role, model in (("teacher", teacher), ("student", student)):
-        # text_encoder.* is never saved; it comes from the Qwen snapshot.
         missing, unexpected = model.load_state_dict(teacher_state, strict=False)
         missing = [key for key in missing if "text_encoder." not in key]
         if missing or unexpected:
             raise RuntimeError(f"{role}: {len(missing)} missing {missing[:5]}, {len(unexpected)} unexpected {unexpected[:5]}")
 
+    # trainer
     trainer = InitializerTrainer(
         system=ConsistencyInitSystem(student=student, teacher=teacher, config=init_config),
         vae_model=vae_model,
@@ -116,7 +114,7 @@ def main() -> None:
         SequentialSampler(train_dataset),
         init_config.frames_threshold,
         max_samples=init_config.max_samples,
-        random_seed=init_config.seed,
+        random_seed=666,
     )
     dataloader = accelerator.prepare(
         DataLoader(
@@ -134,6 +132,7 @@ def main() -> None:
         f"max_updates={init_config.max_updates} | config: {asdict(init_config)}"
     )
 
+    # resume
     output_dir = Path(args.output_dir)
     last_path = output_dir / "model_last.pt"
     if last_path.exists():
@@ -141,6 +140,7 @@ def main() -> None:
         logger.info(f"resumed from {last_path} | update={trainer.updates} epoch={trainer.epoch}")
     accelerator.wait_for_everyone()
 
+    # train
     saved_last_at = -1
     saved_at = -1
     while trainer.updates < init_config.max_updates:

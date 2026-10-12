@@ -71,13 +71,12 @@ def main() -> None:
 
     model_config = OmegaConf.load(args.config).model
 
-    torch.manual_seed(dmd_config.seed)
-
     saved_config = os.path.join(args.output_dir, "config.yaml")
     if accelerator.is_main_process and not os.path.exists(saved_config):
         os.makedirs(args.output_dir, exist_ok=True)
         shutil.copy(args.config, saved_config)
 
+    # load models
     text_encoder_config = model_config.text_encoder
     vae_config = model_config.vae
 
@@ -118,7 +117,6 @@ def main() -> None:
         for _ in range(3)
     )
     for model in (student, teacher, fake_score):
-        # Text is encoded once without grad for every role, so the fp32 layer fusion stays at the teacher values.
         model.layer_weights.requires_grad_(False)
         model.layer_scale.requires_grad_(False)
 
@@ -146,7 +144,6 @@ def main() -> None:
         ("student", student, student_state),
         ("fake_score", fake_score, student_state),
     ):
-        # text_encoder.* is never saved; it comes from the Qwen snapshot.
         missing, unexpected = model.load_state_dict(state, strict=False)
         missing = [key for key in missing if "text_encoder." not in key]
         if missing or unexpected:
@@ -166,7 +163,7 @@ def main() -> None:
         SequentialSampler(train_dataset),
         dmd_config.frames_threshold,
         max_samples=dmd_config.max_samples,
-        random_seed=dmd_config.seed,
+        random_seed=666,
     )
     dataloader = accelerator.prepare(
         DataLoader(
@@ -186,6 +183,7 @@ def main() -> None:
         f"config: {asdict(dmd_config)}"
     )
 
+    # resume
     output_dir = Path(args.output_dir)
     last_path = output_dir / "model_last.pt"
     if last_path.exists():
@@ -196,6 +194,7 @@ def main() -> None:
         )
     accelerator.wait_for_everyone()
 
+    # train
     saved_last_at = -1
     saved_at = -1
     while trainer.fake_score_updates < max_fake_updates:

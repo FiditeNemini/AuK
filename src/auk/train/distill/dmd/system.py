@@ -12,8 +12,6 @@ from auk.model import CFMEdit
 from auk.train.distill.common import (
     PreparedBatch,
     add_noise,
-    batch_time,
-    expand_time,
     guided_velocity,
     predict_clean,
     velocity_to_clean,
@@ -55,7 +53,6 @@ class DMDConfig:
     frames_threshold: int = 10000
     max_samples: int = 24
     dataloader_num_workers: int = 4
-    seed: int = 666
 
     ema_beta: float = 0.999
     ema_update_after_step: int = 0
@@ -92,7 +89,7 @@ def weighted_mse(
         per_sample = (squared * mask).sum(dim=reduce_dims) / mask.sum(dim=reduce_dims).clamp_min(eps)
         weight = sample_weight.to(per_sample.dtype)
         return (per_sample * weight).sum() / weight.sum().clamp_min(eps)
-    weight = expand_time(sample_weight, prediction) * mask
+    weight = sample_weight[:, None, None].to(prediction.dtype) * mask
     return (squared * weight).sum() / weight.sum().clamp_min(eps)
 
 
@@ -127,7 +124,6 @@ class DMDSystem(nn.Module):
         self.time_grid = time_grid + config.sway_sampling_coef * (torch.cos(torch.pi / 2 * time_grid) - 1 + time_grid)
 
     def train(self, mode: bool = True) -> "DMDSystem":
-        # nn.Module.train recurses into children; the teacher has dropout and, like the Qwen all roles share, must stay in eval.
         super().train(mode)
         self.teacher.eval()
         return self
@@ -171,7 +167,7 @@ class DMDSystem(nn.Module):
                     velocity = self.student.transformer(
                         x=current,
                         text=batch.text,
-                        time=batch_time(step_time, current.shape[0], current),
+                        time=step_time.expand(current.shape[0]).to(current.dtype),
                         mask=batch.valid_mask,
                         c_mask=batch.c_mask,
                         ref=batch.ref,
@@ -191,7 +187,7 @@ class DMDSystem(nn.Module):
         prediction = self.fake_score.transformer(
             x=noisy,
             text=batch.text,
-            time=batch_time(time, noisy.shape[0], noisy),
+            time=time,
             mask=batch.valid_mask,
             c_mask=batch.c_mask,
             ref=batch.ref,
@@ -232,7 +228,7 @@ class DMDSystem(nn.Module):
         conditional, unconditional = self.teacher.transformer(
             x=noisy,
             text=batch.text,
-            time=batch_time(time, noisy.shape[0], noisy),
+            time=time,
             mask=batch.valid_mask,
             c_mask=batch.c_mask,
             ref=batch.ref,

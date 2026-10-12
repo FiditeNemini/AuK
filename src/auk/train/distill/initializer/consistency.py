@@ -12,8 +12,6 @@ from auk.model import CFMEdit
 from auk.train.distill.common import (
     PreparedBatch,
     add_noise,
-    batch_time,
-    expand_time,
     guided_velocity,
     predict_clean,
 )
@@ -48,7 +46,6 @@ class InitConfig:
     frames_threshold: int = 10000
     max_samples: int = 24
     dataloader_num_workers: int = 2
-    seed: int = 666
 
     ema_beta: float = 0.999
     ema_update_after_step: int = 0
@@ -149,7 +146,7 @@ class ConsistencyInitSystem(nn.Module):
                 conditional, unconditional = self.teacher.transformer(
                     x=noisy_current,
                     text=batch.text,
-                    time=batch_time(current, noisy_current.shape[0], noisy_current),
+                    time=current,
                     mask=batch.valid_mask,
                     c_mask=batch.c_mask,
                     ref=batch.ref,
@@ -157,7 +154,7 @@ class ConsistencyInitSystem(nn.Module):
                     cfg_infer=True,
                 ).chunk(2)
                 velocity = guided_velocity(conditional, unconditional, config.teacher_cfg_scale)
-                noisy_endpoint = noisy_current + expand_time(endpoint - current, noisy_current) * velocity
+                noisy_endpoint = noisy_current + (endpoint - current)[:, None, None] * velocity
         else:
             noisy_endpoint = add_noise(batch.clean, noise, endpoint)
 

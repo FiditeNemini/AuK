@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import torch
 from accelerate import Accelerator
+from accelerate.logging import get_logger
 from ema_pytorch import EMA
 from torch import nn
 from torch.optim import AdamW
@@ -14,6 +15,9 @@ from transformers import get_scheduler
 
 from auk.train.distill.common import prepare_batch, reduce_metrics
 from auk.train.distill.initializer.consistency import ConsistencyInitSystem, InitConfig
+
+
+logger = get_logger(__name__)
 
 
 class InitializerTrainer:
@@ -65,9 +69,7 @@ class InitializerTrainer:
         self.system.train()
         # The CM time-pair schedule advances by global samples, so all ranks must agree on it.
         global_batch_size = int(
-            self.accelerator.reduce(
-                torch.tensor(prepared.clean.shape[0], device=self.accelerator.device, dtype=torch.long)
-            ).item()
+            self.accelerator.reduce(torch.tensor(prepared.clean.shape[0], device=self.accelerator.device)).item()
         )
         self.optimizer.zero_grad()
         loss, metrics = self.system(prepared, self.updates, global_batch_size=global_batch_size)
@@ -90,33 +92,29 @@ class InitializerTrainer:
         return reduce_metrics(self.accelerator, metrics)
 
     def save_checkpoint(self, path: Path, *, with_training_state: bool) -> None:
-        """Write a file AukInfer loads directly; with_training_state adds what resuming needs."""
         self.accelerator.wait_for_everyone()
-        if self.accelerator.is_main_process:
-            checkpoint = {
-                "ema_model_state_dict": {k: v for k, v in self.student_ema.state_dict().items() if "text_encoder." not in k},
-                "update": self.updates,
-                "metadata": {"resolved_config": self.resolved_config},
-            }
-            if with_training_state:
-                student = self.accelerator.unwrap_model(self.system).student
-                checkpoint.update(
-                    {
-                        "student_model_state_dict": {k: v for k, v in student.state_dict().items() if "text_encoder." not in k},
-                        "optimizer_state_dict": self.optimizer.state_dict(),
-                        "scheduler_state_dict": self.scheduler.state_dict(),
-                        "epoch": self.epoch,
-                    }
-                )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # Write-then-rename so a crash mid-write never leaves a truncated model_last.pt.
-            temporary = path.with_name(f".{path.name}.tmp")
-            self.accelerator.save(checkpoint, temporary)
-            temporary.replace(path)
-        self.accelerator.wait_for_everyone()
+        if not self.accelerator.is_main_process:
+            return
+        checkpoint = {
+            "ema_model_state_dict": {k: v for k, v in self.student_ema.state_dict().items() if "text_encoder." not in k},
+            "update": self.updates,
+            "metadata": {"resolved_config": self.resolved_config},
+        }
+        if with_training_state:
+            student = self.accelerator.unwrap_model(self.system).student
+            checkpoint.update(
+                {
+                    "student_model_state_dict": {k: v for k, v in student.state_dict().items() if "text_encoder." not in k},
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scheduler_state_dict": self.scheduler.state_dict(),
+                    "epoch": self.epoch,
+                }
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.accelerator.save(checkpoint, path)
+        logger.info(f"saved {path} | update={self.updates}")
 
     def load_checkpoint(self, path: Path) -> None:
-        """Restore a file written by save_checkpoint(with_training_state=True)."""
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         student = self.accelerator.unwrap_model(self.system).student
         for module, key in ((student, "student_model_state_dict"), (self.student_ema, "ema_model_state_dict")):
