@@ -44,21 +44,6 @@ def prepare_batch(
     }
 
 
-def predict_clean(backbone: nn.Module, noisy: torch.Tensor, batch: Mapping[str, Any], time: torch.Tensor) -> torch.Tensor:
-    """Fully conditioned clean prediction of one backbone, with padded frames restored to the ground truth."""
-    velocity = backbone(
-        x=noisy,
-        text=batch["text"],
-        time=time.expand(noisy.shape[0]),
-        mask=batch["valid_mask"],
-        c_mask=batch["c_mask"],
-        ref=batch["ref"],
-        ref_mask=batch["ref_mask"],
-    )
-    clean = noisy + (1.0 - time[:, None, None]) * velocity
-    return torch.where(batch["valid_mask"].unsqueeze(-1), clean, batch["clean"])
-
-
 def reduce_metrics(
     accelerator: Accelerator,
     metrics: Mapping[str, float | torch.Tensor],

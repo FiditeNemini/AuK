@@ -9,7 +9,6 @@ import torch
 from torch import nn
 
 from auk.model import CFMEdit
-from auk.train.distill.common import predict_clean
 
 
 @dataclass
@@ -140,12 +139,11 @@ class DMDSystem(nn.Module):
         time_grid = self.time_grid.to(batch["clean"].device)
         step_index = int(torch.randint(time_grid.numel() - 1, (1,), device=batch["clean"].device).item())
         selected_time = time_grid[step_index : step_index + 1].to(batch["clean"].dtype)
-        frame_mask = batch["valid_mask"].unsqueeze(-1)
         if self.config.simulation_free:
             noise = torch.randn_like(batch["clean"])
-            current = ((1.0 - selected_time[:, None, None]) * noise + selected_time[:, None, None] * batch["clean"]) * frame_mask
+            current = (1.0 - selected_time[:, None, None]) * noise + selected_time[:, None, None] * batch["clean"]
         else:
-            current = torch.randn_like(batch["clean"]) * frame_mask
+            current = torch.randn_like(batch["clean"])
             with torch.no_grad():
                 for index in range(step_index):
                     step_time = time_grid[index : index + 1]
@@ -158,10 +156,19 @@ class DMDSystem(nn.Module):
                         ref=batch["ref"],
                         ref_mask=batch["ref_mask"],
                     )
-                    current = (current + (time_grid[index + 1] - time_grid[index]) * velocity) * frame_mask
+                    current = current + (time_grid[index + 1] - time_grid[index]) * velocity
 
         with torch.set_grad_enabled(with_grad):
-            clean = predict_clean(self.student.transformer, current, batch, selected_time)
+            velocity = self.student.transformer(
+                x=current,
+                text=batch["text"],
+                time=selected_time.expand(current.shape[0]),
+                mask=batch["valid_mask"],
+                c_mask=batch["c_mask"],
+                ref=batch["ref"],
+                ref_mask=batch["ref_mask"],
+            )
+            clean = current + (1.0 - selected_time[:, None, None]) * velocity
         return clean, selected_time
 
     def fake_score_loss(self, batch: Mapping[str, Any]) -> dict[str, Any]:
@@ -195,8 +202,26 @@ class DMDSystem(nn.Module):
         time = sample_decoupled_time(batch, schedule=self.config.dm_time_schedule)
         noise = torch.randn_like(detached_clean)
         noisy = (1.0 - time[:, None, None]) * noise + time[:, None, None] * detached_clean
-        fake_clean = predict_clean(self.fake_score.transformer, noisy, batch, time)
-        teacher_cond_clean = predict_clean(self.teacher.transformer, noisy, batch, time)
+        fake_velocity = self.fake_score.transformer(
+            x=noisy,
+            text=batch["text"],
+            time=time,
+            mask=batch["valid_mask"],
+            c_mask=batch["c_mask"],
+            ref=batch["ref"],
+            ref_mask=batch["ref_mask"],
+        )
+        teacher_velocity = self.teacher.transformer(
+            x=noisy,
+            text=batch["text"],
+            time=time,
+            mask=batch["valid_mask"],
+            c_mask=batch["c_mask"],
+            ref=batch["ref"],
+            ref_mask=batch["ref_mask"],
+        )
+        fake_clean = noisy + (1.0 - time[:, None, None]) * fake_velocity
+        teacher_cond_clean = noisy + (1.0 - time[:, None, None]) * teacher_velocity
         return fake_clean - teacher_cond_clean, teacher_cond_clean, time
 
     def ca_gradient_term(
@@ -221,16 +246,14 @@ class DMDSystem(nn.Module):
             cfg_infer=True,
         ).chunk(2)
         guided = unconditional + config.teacher_cfg_scale * (conditional - unconditional)
-        frame_mask = batch["valid_mask"].unsqueeze(-1)
-        velocities = torch.stack((conditional, unconditional, guided))
-        cond_clean, uncond_clean, cfg_clean = torch.where(
-            frame_mask, noisy + (1.0 - time[:, None, None]) * velocities, batch["clean"]
-        )
+        cond_clean = noisy + (1.0 - time[:, None, None]) * conditional
+        uncond_clean = noisy + (1.0 - time[:, None, None]) * unconditional
+        cfg_clean = noisy + (1.0 - time[:, None, None]) * guided
         baseline = cond_clean - cfg_clean
         if not config.ca_apg or (config.ca_apg_eta == 1.0 and config.ca_apg_norm_threshold == 0.0):
             return baseline, baseline, time
 
-        mask = frame_mask.expand_as(cond_clean).to(torch.float32)
+        mask = batch["valid_mask"].unsqueeze(-1).expand_as(cond_clean).to(torch.float32)
         reduce_dims = tuple(range(1, cond_clean.ndim))
         guidance = (cond_clean.float() - uncond_clean.float()) * mask
         if config.ca_apg_norm_threshold > 0:
@@ -264,8 +287,7 @@ class DMDSystem(nn.Module):
             ca_raw, baseline_ca_raw, ca_time = self.ca_gradient_term(detached_clean, batch, rollout_time)
 
             residual = (detached_clean - (teacher_dm_cond_clean - baseline_ca_raw)).abs()
-            frame_mask = batch["valid_mask"].unsqueeze(-1)
-            mask = frame_mask.expand_as(residual).to(residual.dtype)
+            mask = batch["valid_mask"].unsqueeze(-1).expand_as(residual).to(residual.dtype)
             reduce_dims = tuple(range(1, residual.ndim))
             denominator = (residual * mask).sum(dim=reduce_dims) / mask.sum(dim=reduce_dims).clamp_min(self.eps)
             denominator = torch.nan_to_num(denominator, nan=self.eps, neginf=self.eps).clamp_min(self.eps)
@@ -275,7 +297,7 @@ class DMDSystem(nn.Module):
             ca_gradient = ca_raw / denominator[:, None, None]
             dm_gradient = dm_raw / denominator[:, None, None]
             dmd_gradient = self.config.ca_weight * ca_gradient + self.config.dm_weight * dm_gradient
-            dmd_gradient = torch.nan_to_num(dmd_gradient, posinf=0.0, neginf=0.0) * frame_mask
+            dmd_gradient = torch.nan_to_num(dmd_gradient, posinf=0.0, neginf=0.0)
 
         surrogate_target = (student_clean - dmd_gradient).detach()
         dmd_weight, _ = self.routing_weights(batch)

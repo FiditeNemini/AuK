@@ -9,7 +9,6 @@ import torch
 from torch import nn
 
 from auk.model import CFMEdit
-from auk.train.distill.common import predict_clean
 
 
 @dataclass
@@ -151,9 +150,27 @@ class ConsistencyInitSystem(nn.Module):
         # Both student passes must see the same dropout draw, otherwise the pair
         # differs by dropout noise rather than by the time step alone.
         with torch.random.fork_rng(devices=[noisy_current.device]):
-            prediction = predict_clean(self.student.transformer, noisy_current, batch, current)
+            velocity = self.student.transformer(
+                x=noisy_current,
+                text=batch["text"],
+                time=current,
+                mask=batch["valid_mask"],
+                c_mask=batch["c_mask"],
+                ref=batch["ref"],
+                ref_mask=batch["ref_mask"],
+            )
+            prediction = noisy_current + (1.0 - current[:, None, None]) * velocity
         with torch.no_grad():
-            target = predict_clean(self.student.transformer, noisy_endpoint, batch, endpoint)
+            velocity = self.student.transformer(
+                x=noisy_endpoint,
+                text=batch["text"],
+                time=endpoint,
+                mask=batch["valid_mask"],
+                c_mask=batch["c_mask"],
+                ref=batch["ref"],
+                ref_mask=batch["ref_mask"],
+            )
+            target = noisy_endpoint + (1.0 - endpoint[:, None, None]) * velocity
         per_sample, unweighted = self.cm_distance(prediction, target, batch, current, endpoint)
 
         return {
