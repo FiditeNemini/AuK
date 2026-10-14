@@ -1,9 +1,8 @@
-"""Flow parameterization, conditioning, and run plumbing shared by both distillation stages."""
+"""Conditioning and run plumbing shared by both distillation stages."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from accelerate import Accelerator
@@ -13,36 +12,6 @@ from auk.model import CFMEdit
 from auk.model.utils import lens_to_mask
 
 
-@dataclass
-class DistillScriptArgs:
-    """Paths and resources shared by both distillation stages."""
-
-    train_jsonl: str
-    config: str = "ckpts/AuK/config.yaml"
-    teacher_ckpt: str = "ckpts/AuK/auk_base.safetensors"
-    weight_type: Literal["bf16", "fp16", "fp32"] = "bf16"
-    attn_backend: str = field(default="torch", metadata={"help": "Overrides model.arch.attn_backend."})
-
-
-@dataclass
-class PreparedBatch:
-    """Conditioning shared by teacher, student, and fake-score roles."""
-
-    clean: torch.Tensor
-    ref: torch.Tensor
-    text: torch.Tensor
-    lens: torch.Tensor
-    ref_lens: torch.Tensor
-    valid_mask: torch.Tensor
-    ref_mask: torch.Tensor
-    c_mask: torch.Tensor
-    tasks: Sequence[str | None] | None = None
-
-    @property
-    def loss_mask(self) -> torch.Tensor:
-        return self.valid_mask.unsqueeze(-1)
-
-
 @torch.no_grad()
 def prepare_batch(
     batch: Mapping[str, Any],
@@ -50,7 +19,7 @@ def prepare_batch(
     vae_model: nn.Module,
     text_model: CFMEdit,
     dtype: torch.dtype,
-) -> PreparedBatch:
+) -> dict[str, Any]:
     """Encode each physical input once."""
     device = next(vae_model.parameters()).device
 
@@ -62,57 +31,37 @@ def prepare_batch(
     )
     text, c_mask = text_model.encode_text(batch["cond_inputs"], device)
 
-    return PreparedBatch(
-        clean=clean.to(dtype),
-        ref=ref.to(dtype),
-        text=text.to(dtype),
-        lens=lens,
-        ref_lens=ref_lens,
-        valid_mask=lens_to_mask(lens, length=clean.shape[1]),
-        ref_mask=lens_to_mask(ref_lens, length=ref.shape[1]),
-        c_mask=c_mask,
-        tasks=batch.get("_tasks"),
-    )
+    return {
+        "clean": clean.to(dtype),
+        "ref": ref.to(dtype),
+        "text": text.to(dtype),
+        "lens": lens,
+        "ref_lens": ref_lens,
+        "valid_mask": lens_to_mask(lens, length=clean.shape[1]),
+        "ref_mask": lens_to_mask(ref_lens, length=ref.shape[1]),
+        "c_mask": c_mask,
+        "tasks": batch["tasks"],
+    }
 
 
-def add_noise(clean: torch.Tensor, noise: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
-    """Linear flow interpolation with noise at t=0 and data at t=1."""
-    expanded = time[:, None, None].to(clean.dtype)
-    return (1.0 - expanded) * noise + expanded * clean
-
-
-def velocity_to_clean(noisy: torch.Tensor, velocity: torch.Tensor, time: torch.Tensor, batch: PreparedBatch) -> torch.Tensor:
-    """Clean endpoint implied by a velocity, with padded frames restored to the ground truth."""
-    clean = noisy + (1.0 - time[:, None, None].to(noisy.dtype)) * velocity
-    return torch.where(batch.loss_mask, clean, batch.clean)
-
-
-def guided_velocity(conditional: torch.Tensor, unconditional: torch.Tensor, cfg_scale: float) -> torch.Tensor:
-    """Blend the two CFG branches into one guided velocity.
-
-    Training uses v_g = v_u + s*(v_c-v_u), which equals the inference-side
-    v_c + (s-1)*(v_c-v_u); a cfg_scale of s corresponds to w = s-1.
-    """
-    return unconditional + cfg_scale * (conditional - unconditional)
-
-
-def predict_clean(backbone: nn.Module, noisy: torch.Tensor, batch: PreparedBatch, time: torch.Tensor) -> torch.Tensor:
-    """Fully conditioned clean prediction of one backbone."""
+def predict_clean(backbone: nn.Module, noisy: torch.Tensor, batch: Mapping[str, Any], time: torch.Tensor) -> torch.Tensor:
+    """Fully conditioned clean prediction of one backbone, with padded frames restored to the ground truth."""
     velocity = backbone(
         x=noisy,
-        text=batch.text,
-        time=time.expand(noisy.shape[0]).to(noisy.dtype),
-        mask=batch.valid_mask,
-        c_mask=batch.c_mask,
-        ref=batch.ref,
-        ref_mask=batch.ref_mask,
+        text=batch["text"],
+        time=time.expand(noisy.shape[0]),
+        mask=batch["valid_mask"],
+        c_mask=batch["c_mask"],
+        ref=batch["ref"],
+        ref_mask=batch["ref_mask"],
     )
-    return velocity_to_clean(noisy, velocity, time, batch)
+    clean = noisy + (1.0 - time[:, None, None]) * velocity
+    return torch.where(batch["valid_mask"].unsqueeze(-1), clean, batch["clean"])
 
 
 def reduce_metrics(
     accelerator: Accelerator,
-    metrics: Mapping[str, float],
+    metrics: Mapping[str, float | torch.Tensor],
     *,
     sum_keys: Mapping[str, str] | None = None,
     max_keys: Sequence[str] = (),

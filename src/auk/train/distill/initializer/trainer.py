@@ -66,14 +66,13 @@ class InitializerTrainer:
             dtype=next(student.parameters()).dtype,
         )
         step_start = time.perf_counter()
-        self.system.train()
         # The CM time-pair schedule advances by global samples, so all ranks must agree on it.
         global_batch_size = int(
-            self.accelerator.reduce(torch.tensor(prepared.clean.shape[0], device=self.accelerator.device)).item()
+            self.accelerator.reduce(torch.tensor(prepared["clean"].shape[0], device=self.accelerator.device)).item()
         )
         self.optimizer.zero_grad()
-        loss, metrics = self.system(prepared, self.updates, global_batch_size=global_batch_size)
-        self.accelerator.backward(loss)
+        metrics = self.system(prepared, self.updates, global_batch_size=global_batch_size)
+        self.accelerator.backward(metrics["total_loss"])
         grad_norm = self.accelerator.clip_grad_norm_(student.parameters(), self.max_grad_norm)
         self.optimizer.step()
         self.scheduler.step()
@@ -83,8 +82,8 @@ class InitializerTrainer:
             {
                 "grad_norm": float(grad_norm.detach()),
                 "lr": float(self.scheduler.get_last_lr()[0]),
-                "local_samples": float(prepared.clean.shape[0]),
-                "target_frames_mean": float(prepared.lens.float().mean().detach()),
+                "local_samples": float(prepared["clean"].shape[0]),
+                "target_frames_mean": float(prepared["lens"].float().mean().detach()),
                 "gpu_memory_peak_gib": float(torch.cuda.max_memory_allocated(self.accelerator.device) / 2**30),
                 "step_time_sec": float(time.perf_counter() - step_start),
             }

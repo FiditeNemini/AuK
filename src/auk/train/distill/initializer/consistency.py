@@ -3,18 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Mapping
 
 import torch
 from torch import nn
 
 from auk.model import CFMEdit
-from auk.train.distill.common import (
-    PreparedBatch,
-    add_noise,
-    guided_velocity,
-    predict_clean,
-)
+from auk.train.distill.common import predict_clean
 
 
 @dataclass
@@ -66,14 +61,9 @@ class ConsistencyInitSystem(nn.Module):
         self.config = config
         self.eps = config.eps
 
-    def train(self, mode: bool = True) -> "ConsistencyInitSystem":
-        super().train(mode)
-        self.teacher.eval()
-        return self
-
     def pair_times(
         self,
-        batch: PreparedBatch,
+        batch: Mapping[str, Any],
         iteration: int,
         *,
         global_batch_size: int,
@@ -83,7 +73,7 @@ class ConsistencyInitSystem(nn.Module):
         The schedule is defined on noise levels (1 = pure noise).
         """
         config = self.config
-        normal = torch.randn(batch.clean.shape[0], device=batch.clean.device, dtype=batch.clean.dtype)
+        normal = torch.randn(batch["clean"].shape[0], device=batch["clean"].device, dtype=batch["clean"].dtype)
         current_noise_level = torch.sigmoid(normal * config.train_p_std + config.train_p_mean)
         current_noise_level = current_noise_level * (config.max_time - config.min_time) + config.min_time
         stage = (iteration + config.ct_resume_updates) * global_batch_size // (config.ct_kimg_per_stage * 1000)
@@ -105,14 +95,14 @@ class ConsistencyInitSystem(nn.Module):
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
-        batch: PreparedBatch,
+        batch: Mapping[str, Any],
         current: torch.Tensor,
         endpoint: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-sample (weighted, unweighted) consistency distance."""
         config = self.config
         difference = prediction.float() - target.float()
-        mask = batch.loss_mask.expand_as(difference).to(difference.dtype)
+        mask = batch["valid_mask"].unsqueeze(-1).expand_as(difference).to(difference.dtype)
         distance = ((difference * mask).square().sum(dim=tuple(range(1, difference.ndim)))).sqrt()
         if config.huber_const > 0:
             unweighted = torch.sqrt(distance.square() + config.huber_const**2) - config.huber_const
@@ -131,32 +121,32 @@ class ConsistencyInitSystem(nn.Module):
 
     def forward(
         self,
-        batch: PreparedBatch,
+        batch: Mapping[str, Any],
         iteration: int,
         *,
         global_batch_size: int,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> dict[str, Any]:
         config = self.config
         current, endpoint, ratio = self.pair_times(batch, iteration, global_batch_size=global_batch_size)
 
-        noise = torch.randn_like(batch.clean)
-        noisy_current = add_noise(batch.clean, noise, current)
+        noise = torch.randn_like(batch["clean"])
+        noisy_current = (1.0 - current[:, None, None]) * noise + current[:, None, None] * batch["clean"]
         if config.use_cd:
             with torch.no_grad():
                 conditional, unconditional = self.teacher.transformer(
                     x=noisy_current,
-                    text=batch.text,
+                    text=batch["text"],
                     time=current,
-                    mask=batch.valid_mask,
-                    c_mask=batch.c_mask,
-                    ref=batch.ref,
-                    ref_mask=batch.ref_mask,
+                    mask=batch["valid_mask"],
+                    c_mask=batch["c_mask"],
+                    ref=batch["ref"],
+                    ref_mask=batch["ref_mask"],
                     cfg_infer=True,
                 ).chunk(2)
-                velocity = guided_velocity(conditional, unconditional, config.teacher_cfg_scale)
+                velocity = unconditional + config.teacher_cfg_scale * (conditional - unconditional)
                 noisy_endpoint = noisy_current + (endpoint - current)[:, None, None] * velocity
         else:
-            noisy_endpoint = add_noise(batch.clean, noise, endpoint)
+            noisy_endpoint = (1.0 - endpoint[:, None, None]) * noise + endpoint[:, None, None] * batch["clean"]
 
         # Both student passes must see the same dropout draw, otherwise the pair
         # differs by dropout noise rather than by the time step alone.
@@ -166,11 +156,10 @@ class ConsistencyInitSystem(nn.Module):
             target = predict_clean(self.student.transformer, noisy_endpoint, batch, endpoint)
         per_sample, unweighted = self.cm_distance(prediction, target, batch, current, endpoint)
 
-        total = per_sample.sum() / per_sample.shape[0]
-        return total, {
+        return {
+            "total_loss": per_sample.sum() / per_sample.shape[0],
             "current_time": float(current.mean()),
             "endpoint_time": float(endpoint.mean()),
             "ct_ratio": ratio,
             "consistency_unweighted": float(unweighted.detach().mean()),
-            "total_loss": float(total.detach()),
         }

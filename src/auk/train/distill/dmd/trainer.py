@@ -84,9 +84,8 @@ class DMDTrainer:
             dtype=next(unwrapped.student.transformer.parameters()).dtype,
         )
         step_start = time.perf_counter()
-        self.system.train()
-        fake_loss, metrics = self.system("fake_score", prepared)
-        self.accelerator.backward(fake_loss)
+        metrics = self.system("fake_score", prepared)
+        self.accelerator.backward(metrics["fake_score_loss"])
         fake_grad_norm = self.accelerator.clip_grad_norm_(unwrapped.fake_score.transformer.parameters(), self.max_grad_norm)
         self.fake_score_optimizer.step()
         self.fake_score_scheduler.step()
@@ -96,8 +95,8 @@ class DMDTrainer:
 
         student_updated = self.fake_updates_since_student >= self.student_update_interval
         if student_updated:
-            student_loss, student_metrics = self.system("student", prepared)
-            self.accelerator.backward(student_loss)
+            student_metrics = self.system("student", prepared)
+            self.accelerator.backward(student_metrics["student_loss"])
             student_grad_norm = self.accelerator.clip_grad_norm_(unwrapped.student.transformer.parameters(), self.max_grad_norm)
             self.student_optimizer.step()
             self.student_scheduler.step()
@@ -116,11 +115,11 @@ class DMDTrainer:
                 "fake_score_grad_norm": float(fake_grad_norm.detach()),
                 "fake_score_lr": float(self.fake_score_scheduler.get_last_lr()[0]),
                 "student_lr": float(self.student_scheduler.get_last_lr()[0]),
-                "local_samples": float(prepared.clean.shape[0]),
-                "local_target_frames": float(prepared.lens.sum().detach()),
-                "local_reference_frames": float(prepared.ref_lens.sum().detach()),
-                "target_frames_max": float(prepared.lens.max().detach()),
-                "target_frames_mean": float(prepared.lens.float().mean().detach()),
+                "local_samples": float(prepared["clean"].shape[0]),
+                "local_target_frames": float(prepared["lens"].sum().detach()),
+                "local_reference_frames": float(prepared["ref_lens"].sum().detach()),
+                "target_frames_max": float(prepared["lens"].max().detach()),
+                "target_frames_mean": float(prepared["lens"].float().mean().detach()),
             }
         )
         torch.cuda.synchronize(self.accelerator.device)

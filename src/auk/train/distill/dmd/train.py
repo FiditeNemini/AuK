@@ -8,7 +8,7 @@ import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Literal
 
 import torch
 from accelerate import Accelerator
@@ -22,7 +22,6 @@ from transformers import HfArgumentParser, Qwen2_5OmniProcessor, Qwen2_5OmniThin
 from auk.model import CFMEdit, Flux2Edit
 from auk.model.vae import load_vae_model
 from auk.model.vae.bigvgan_flow_vae import BigVGANFlowVAEConfig
-from auk.train.distill.common import DistillScriptArgs
 from auk.train.distill.dmd.system import DMDConfig, DMDSystem
 from auk.train.distill.dmd.trainer import DMDTrainer
 from auk.train.train import AukJsonlDataset, DynamicBatchSampler
@@ -34,7 +33,12 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class ScriptArgs(DistillScriptArgs):
+class ScriptArgs:
+    train_jsonl: str
+    config: str = "ckpts/AuK/config.yaml"
+    teacher_ckpt: str = "ckpts/AuK/auk_base.safetensors"
+    weight_type: Literal["bf16", "fp16", "fp32"] = "bf16"
+    attn_backend: str = field(default="torch", metadata={"help": "Overrides model.arch.attn_backend."})
     output_dir: str = "ckpts/auk_dmd"
     checkpoint_every_n_layers: int | None = field(
         default=None,
@@ -48,20 +52,6 @@ class ScriptArgs(DistillScriptArgs):
         default=True,
         metadata={"help": "False takes the online student, which only a stage-one model_last.pt carries."},
     )
-
-
-class AukJsonlDistillDataset(AukJsonlDataset):
-    """AukJsonlDataset plus the optional per-record task label that task routing selects on."""
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        item = super().__getitem__(index)
-        item["task"] = self.data[index].get("task")
-        return item
-
-    def collate_fn(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        collated = super().collate_fn(batch)
-        collated["_tasks"] = [item["task"] for item in batch]
-        return collated
 
 
 def main() -> None:
@@ -157,7 +147,7 @@ def main() -> None:
         accelerator=accelerator,
     )
 
-    train_dataset = AukJsonlDistillDataset(args.train_jsonl, text_processor)
+    train_dataset = AukJsonlDataset(args.train_jsonl, text_processor)
     accelerator.even_batches = False
     batch_sampler = DynamicBatchSampler(
         SequentialSampler(train_dataset),

@@ -6,8 +6,9 @@ import logging
 import os
 import shutil
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import torch
 from accelerate import Accelerator
@@ -21,7 +22,6 @@ from transformers import HfArgumentParser, Qwen2_5OmniProcessor, Qwen2_5OmniThin
 from auk.model import CFMEdit, Flux2Edit
 from auk.model.vae import load_vae_model
 from auk.model.vae.bigvgan_flow_vae import BigVGANFlowVAEConfig
-from auk.train.distill.common import DistillScriptArgs
 from auk.train.distill.initializer.consistency import ConsistencyInitSystem, InitConfig
 from auk.train.distill.initializer.trainer import InitializerTrainer
 from auk.train.train import AukJsonlDataset, DynamicBatchSampler
@@ -33,7 +33,12 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class ScriptArgs(DistillScriptArgs):
+class ScriptArgs:
+    train_jsonl: str
+    config: str = "ckpts/AuK/config.yaml"
+    teacher_ckpt: str = "ckpts/AuK/auk_base.safetensors"
+    weight_type: Literal["bf16", "fp16", "fp32"] = "bf16"
+    attn_backend: str = field(default="torch", metadata={"help": "Overrides model.arch.attn_backend."})
     output_dir: str = "ckpts/auk_cm_init"
 
 

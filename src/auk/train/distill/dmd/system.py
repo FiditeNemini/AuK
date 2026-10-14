@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Mapping
 
 import torch
 from torch import nn
 
 from auk.model import CFMEdit
-from auk.train.distill.common import (
-    PreparedBatch,
-    add_noise,
-    guided_velocity,
-    predict_clean,
-    velocity_to_clean,
-)
+from auk.train.distill.common import predict_clean
 
 
 @dataclass
@@ -69,7 +63,7 @@ APG_EPS = 1e-12
 def weighted_mse(
     prediction: torch.Tensor,
     target: torch.Tensor,
-    loss_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
     sample_weight: torch.Tensor,
     eps: float,
     *,
@@ -82,27 +76,26 @@ def weighted_mse(
     to its own masked MSE first and the weights then average those, making every
     sample count the same regardless of length.
     """
-    mask = loss_mask.expand_as(prediction).to(prediction.dtype)
+    mask = valid_mask.unsqueeze(-1).expand_as(prediction).to(prediction.dtype)
     squared = (prediction - target).square()
     if mean_per_sample:
         reduce_dims = tuple(range(1, prediction.ndim))
         per_sample = (squared * mask).sum(dim=reduce_dims) / mask.sum(dim=reduce_dims).clamp_min(eps)
-        weight = sample_weight.to(per_sample.dtype)
-        return (per_sample * weight).sum() / weight.sum().clamp_min(eps)
+        return (per_sample * sample_weight).sum() / sample_weight.sum().clamp_min(eps)
     weight = sample_weight[:, None, None].to(prediction.dtype) * mask
     return (squared * weight).sum() / weight.sum().clamp_min(eps)
 
 
 def sample_decoupled_time(
-    batch: PreparedBatch,
+    batch: Mapping[str, Any],
     *,
     schedule: str,
     lower_bound: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    raw = torch.rand((batch.clean.shape[0],), device=batch.clean.device, dtype=batch.clean.dtype)
+    raw = torch.rand((batch["clean"].shape[0],), device=batch["clean"].device, dtype=batch["clean"].dtype)
     # "decoupled-hybrid" draws from U(lower_bound, 1): CA only aligns states cleaner than the rollout.
     if schedule == "decoupled-hybrid":
-        bound = lower_bound.to(raw).clamp(0.0, 1.0 - 1e-6)
+        bound = lower_bound.clamp(0.0, 1.0 - 1e-6)
         return bound + (1.0 - bound) * raw
     if schedule == "uniform":
         return raw
@@ -123,80 +116,72 @@ class DMDSystem(nn.Module):
         time_grid = torch.linspace(0, 1, config.nfe + 1)
         self.time_grid = time_grid + config.sway_sampling_coef * (torch.cos(torch.pi / 2 * time_grid) - 1 + time_grid)
 
-    def train(self, mode: bool = True) -> "DMDSystem":
-        super().train(mode)
-        self.teacher.eval()
-        return self
-
-    def forward(
-        self,
-        mode: Literal["fake_score", "student"],
-        batch: PreparedBatch,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    def forward(self, mode: Literal["fake_score", "student"], batch: Mapping[str, Any]) -> dict[str, Any]:
         if mode == "fake_score":
             return self.fake_score_loss(batch)
         return self.student_loss(batch)
 
-    def routing_weights(self, batch: PreparedBatch) -> tuple[torch.Tensor, torch.Tensor]:
+    def routing_weights(self, batch: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-sample (dmd, regression) weights; both all-ones when routing is off."""
-        ones = torch.ones(batch.clean.shape[0], device=batch.clean.device, dtype=torch.float32)
+        ones = torch.ones(batch["clean"].shape[0], device=batch["clean"].device, dtype=torch.float32)
         if not self.regression_only_tasks:
             return ones, ones
-        if None in batch.tasks:
+        if None in batch["tasks"]:
             raise ValueError("task_routing needs a 'task' field on every training record")
         regression = torch.tensor(
-            [1.0 if task in self.regression_only_tasks else 0.0 for task in batch.tasks],
-            device=batch.clean.device,
+            [1.0 if task in self.regression_only_tasks else 0.0 for task in batch["tasks"]],
+            device=batch["clean"].device,
             dtype=torch.float32,
         )
         return ones - regression, regression
 
-    def student_rollout(self, batch: PreparedBatch, *, with_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    def student_rollout(self, batch: Mapping[str, Any], *, with_grad: bool) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (clean, time): a student clean prediction at one inference-grid time."""
-        time_grid = self.time_grid.to(batch.clean.device)
-        step_index = int(torch.randint(time_grid.numel() - 1, (1,), device=batch.clean.device).item())
-        selected_time = time_grid[step_index : step_index + 1]
+        time_grid = self.time_grid.to(batch["clean"].device)
+        step_index = int(torch.randint(time_grid.numel() - 1, (1,), device=batch["clean"].device).item())
+        selected_time = time_grid[step_index : step_index + 1].to(batch["clean"].dtype)
+        frame_mask = batch["valid_mask"].unsqueeze(-1)
         if self.config.simulation_free:
-            noise = torch.randn_like(batch.clean)
-            current = add_noise(batch.clean, noise, selected_time) * batch.loss_mask
+            noise = torch.randn_like(batch["clean"])
+            current = ((1.0 - selected_time[:, None, None]) * noise + selected_time[:, None, None] * batch["clean"]) * frame_mask
         else:
-            current = torch.randn_like(batch.clean) * batch.loss_mask
+            current = torch.randn_like(batch["clean"]) * frame_mask
             with torch.no_grad():
                 for index in range(step_index):
                     step_time = time_grid[index : index + 1]
                     velocity = self.student.transformer(
                         x=current,
-                        text=batch.text,
+                        text=batch["text"],
                         time=step_time.expand(current.shape[0]).to(current.dtype),
-                        mask=batch.valid_mask,
-                        c_mask=batch.c_mask,
-                        ref=batch.ref,
-                        ref_mask=batch.ref_mask,
+                        mask=batch["valid_mask"],
+                        c_mask=batch["c_mask"],
+                        ref=batch["ref"],
+                        ref_mask=batch["ref_mask"],
                     )
-                    current = (current + (time_grid[index + 1] - time_grid[index]) * velocity) * batch.loss_mask
+                    current = (current + (time_grid[index + 1] - time_grid[index]) * velocity) * frame_mask
 
         with torch.set_grad_enabled(with_grad):
             clean = predict_clean(self.student.transformer, current, batch, selected_time)
         return clean, selected_time
 
-    def fake_score_loss(self, batch: PreparedBatch) -> tuple[torch.Tensor, dict[str, float]]:
+    def fake_score_loss(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         rollout_clean, rollout_time = self.student_rollout(batch, with_grad=False)
-        time = torch.rand((batch.clean.shape[0],), device=batch.clean.device, dtype=batch.clean.dtype)
+        time = torch.rand((batch["clean"].shape[0],), device=batch["clean"].device, dtype=batch["clean"].dtype)
         noise = torch.randn_like(rollout_clean)
-        noisy = add_noise(rollout_clean, noise, time)
+        noisy = (1.0 - time[:, None, None]) * noise + time[:, None, None] * rollout_clean
         prediction = self.fake_score.transformer(
             x=noisy,
-            text=batch.text,
+            text=batch["text"],
             time=time,
-            mask=batch.valid_mask,
-            c_mask=batch.c_mask,
-            ref=batch.ref,
-            ref_mask=batch.ref_mask,
+            mask=batch["valid_mask"],
+            c_mask=batch["c_mask"],
+            ref=batch["ref"],
+            ref_mask=batch["ref_mask"],
         )
         dmd_weight, _ = self.routing_weights(batch)
-        loss = weighted_mse(prediction, rollout_clean - noise, batch.loss_mask, dmd_weight, self.eps)
-        return loss, {
-            "fake_score_loss": float(loss.detach()),
+        loss = weighted_mse(prediction, rollout_clean - noise, batch["valid_mask"], dmd_weight, self.eps)
+        return {
+            "fake_score_loss": loss,
             "fake_score_time": float(time.detach().mean()),
             "student_rollout_time": float(rollout_time.detach().mean()),
         }
@@ -204,12 +189,12 @@ class DMDSystem(nn.Module):
     def dm_gradient_term(
         self,
         detached_clean: torch.Tensor,
-        batch: PreparedBatch,
+        batch: Mapping[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Distribution-matching direction, the teacher conditional clean it uses, and the time drawn."""
         time = sample_decoupled_time(batch, schedule=self.config.dm_time_schedule)
         noise = torch.randn_like(detached_clean)
-        noisy = add_noise(detached_clean, noise, time)
+        noisy = (1.0 - time[:, None, None]) * noise + time[:, None, None] * detached_clean
         fake_clean = predict_clean(self.fake_score.transformer, noisy, batch, time)
         teacher_cond_clean = predict_clean(self.teacher.transformer, noisy, batch, time)
         return fake_clean - teacher_cond_clean, teacher_cond_clean, time
@@ -217,32 +202,35 @@ class DMDSystem(nn.Module):
     def ca_gradient_term(
         self,
         detached_clean: torch.Tensor,
-        batch: PreparedBatch,
+        batch: Mapping[str, Any],
         rollout_time: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Classifier-alignment direction, its un-projected baseline, and the time drawn."""
         config = self.config
         time = sample_decoupled_time(batch, schedule=config.ca_time_schedule, lower_bound=rollout_time)
         noise = torch.randn_like(detached_clean)
-        noisy = add_noise(detached_clean, noise, time)
+        noisy = (1.0 - time[:, None, None]) * noise + time[:, None, None] * detached_clean
         conditional, unconditional = self.teacher.transformer(
             x=noisy,
-            text=batch.text,
+            text=batch["text"],
             time=time,
-            mask=batch.valid_mask,
-            c_mask=batch.c_mask,
-            ref=batch.ref,
-            ref_mask=batch.ref_mask,
+            mask=batch["valid_mask"],
+            c_mask=batch["c_mask"],
+            ref=batch["ref"],
+            ref_mask=batch["ref_mask"],
             cfg_infer=True,
         ).chunk(2)
-        cond_clean = velocity_to_clean(noisy, conditional, time, batch)
-        uncond_clean = velocity_to_clean(noisy, unconditional, time, batch)
-        cfg_clean = velocity_to_clean(noisy, guided_velocity(conditional, unconditional, config.teacher_cfg_scale), time, batch)
+        guided = unconditional + config.teacher_cfg_scale * (conditional - unconditional)
+        frame_mask = batch["valid_mask"].unsqueeze(-1)
+        velocities = torch.stack((conditional, unconditional, guided))
+        cond_clean, uncond_clean, cfg_clean = torch.where(
+            frame_mask, noisy + (1.0 - time[:, None, None]) * velocities, batch["clean"]
+        )
         baseline = cond_clean - cfg_clean
         if not config.ca_apg or (config.ca_apg_eta == 1.0 and config.ca_apg_norm_threshold == 0.0):
             return baseline, baseline, time
 
-        mask = batch.loss_mask.expand_as(cond_clean).to(torch.float32)
+        mask = frame_mask.expand_as(cond_clean).to(torch.float32)
         reduce_dims = tuple(range(1, cond_clean.ndim))
         guidance = (cond_clean.float() - uncond_clean.float()) * mask
         if config.ca_apg_norm_threshold > 0:
@@ -266,9 +254,9 @@ class DMDSystem(nn.Module):
     def dmd_loss(
         self,
         student_clean: torch.Tensor,
-        batch: PreparedBatch,
+        batch: Mapping[str, Any],
         rollout_time: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> dict[str, Any]:
         """Decompose DMD into CA/DM terms with independent re-noising and one norm."""
         detached_clean = student_clean.detach()
         with torch.no_grad():
@@ -276,7 +264,8 @@ class DMDSystem(nn.Module):
             ca_raw, baseline_ca_raw, ca_time = self.ca_gradient_term(detached_clean, batch, rollout_time)
 
             residual = (detached_clean - (teacher_dm_cond_clean - baseline_ca_raw)).abs()
-            mask = batch.loss_mask.expand_as(residual).to(residual.dtype)
+            frame_mask = batch["valid_mask"].unsqueeze(-1)
+            mask = frame_mask.expand_as(residual).to(residual.dtype)
             reduce_dims = tuple(range(1, residual.ndim))
             denominator = (residual * mask).sum(dim=reduce_dims) / mask.sum(dim=reduce_dims).clamp_min(self.eps)
             denominator = torch.nan_to_num(denominator, nan=self.eps, neginf=self.eps).clamp_min(self.eps)
@@ -286,40 +275,41 @@ class DMDSystem(nn.Module):
             ca_gradient = ca_raw / denominator[:, None, None]
             dm_gradient = dm_raw / denominator[:, None, None]
             dmd_gradient = self.config.ca_weight * ca_gradient + self.config.dm_weight * dm_gradient
-            dmd_gradient = torch.nan_to_num(dmd_gradient, posinf=0.0, neginf=0.0) * batch.loss_mask
+            dmd_gradient = torch.nan_to_num(dmd_gradient, posinf=0.0, neginf=0.0) * frame_mask
 
         surrogate_target = (student_clean - dmd_gradient).detach()
         dmd_weight, _ = self.routing_weights(batch)
         loss = 0.5 * weighted_mse(
             student_clean.float(),
             surrogate_target.float(),
-            batch.loss_mask,
+            batch["valid_mask"],
             dmd_weight,
             self.eps,
         )
-        return loss, {
-            "dmd_loss": float(loss.detach()),
+        return {
+            "dmd_loss": loss,
             "dmd_denominator": float(denominator.detach().mean()),
             "decoupled_ca_time": float(ca_time.detach().mean()),
             "decoupled_dm_time": float(dm_time.detach().mean()),
         }
 
-    def student_loss(self, batch: PreparedBatch) -> tuple[torch.Tensor, dict[str, float]]:
+    def student_loss(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         rollout_clean, rollout_time = self.student_rollout(batch, with_grad=True)
-        dmd_loss, metrics = self.dmd_loss(rollout_clean, batch, rollout_time)
+        losses = self.dmd_loss(rollout_clean, batch, rollout_time)
         _, reg_sample_weight = self.routing_weights(batch)
         reg_loss = weighted_mse(
             rollout_clean.float(),
-            batch.clean.float(),
-            batch.loss_mask,
+            batch["clean"].float(),
+            batch["valid_mask"],
             reg_sample_weight,
             self.eps,
             mean_per_sample=True,
         )
-        metrics.update(
+        losses.update(
             {
                 "student_rollout_time": float(rollout_time.detach().mean()),
-                "reg_loss": float(reg_loss.detach()),
+                "reg_loss": reg_loss,
+                "student_loss": losses["dmd_loss"] + self.config.regression_weight * reg_loss,
             }
         )
-        return dmd_loss + self.config.regression_weight * reg_loss, metrics
+        return losses
