@@ -44,9 +44,7 @@ export VIRTUAL_ENV=$REPO/.venv
 export PATH=$REPO/.venv/bin:\$PATH
 export PYTHONPATH=$REPO/src
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TOKENIZERS_PARALLELISM=false
 export PYTHONWARNINGS="ignore"
-export NUMBA_CACHE_DIR=/tmp/numba_cache_auk_dmd
 
 $REPO/.venv/bin/torchrun --nproc_per_node ${num_gpus} --nnodes 1 \\
   -m auk.train.distill.dmd.train \\
