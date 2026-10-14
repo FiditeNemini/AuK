@@ -125,7 +125,7 @@ class AukJsonlDataset(Dataset):
                     c["text"] = c["text"] + "|<no_prompt_audio>|"
 
         cond_messages = [m for m in messages if m["role"] != "assistant"]
-        return {"audio": gen_audio, "ref_audio": ref_audio, "messages": cond_messages}
+        return {"audio": gen_audio, "ref_audio": ref_audio, "messages": cond_messages, "task": row.get("task")}
 
     def collate_fn(self, batch):
         audios = [item["audio"] for item in batch]
@@ -147,6 +147,7 @@ class AukJsonlDataset(Dataset):
             "ref_audio_lengths": ref_audio_lengths,
             "messages": conversations,
             "cond_inputs": cond_inputs,
+            "tasks": [item["task"] for item in batch],
         }
 
 
