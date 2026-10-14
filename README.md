@@ -23,6 +23,7 @@
 
 ## News
 
+- **[2026/10/14]** 🚀 The **distillation training pipeline** is released! Train your own **AuK-Flash** — see [PR #22](https://github.com/Tencent-Hunyuan/AuK/pull/22).
 - **[2026/09/20]** 🧩 **AuK** is now supported by **audio.cpp**! Run **AuK** and **AuK-Flash** with GGUF offline inference via the `--family auk` models — see the [audio.cpp community model doc](https://github.com/0xShug0/audio.cpp/blob/main/docs/community_models/auk.md).
 - **[2026/09/16]** 💻 Reduced encoder memory by **~7.5 GiB**, making local inference more accessible on **consumer GPUs**. See [PR #19](https://github.com/Tencent-Hunyuan/AuK/pull/19).
 - **[2026/09/13]** 🍎🖥️ **AuK** now officially supports **MLX inference on Apple Silicon** (available on the [feat/mlx-apple-silicon](https://github.com/Tencent-Hunyuan/AuK/tree/feat/mlx-apple-silicon) branch) and **CPU offload for CUDA inference**.
