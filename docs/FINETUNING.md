@@ -47,6 +47,9 @@ source→target pair:
     needs it, a reference/source audio.
   - The **`assistant`** message carries the target audio the model should learn
     to produce.
+- `task` — optional task label (string), a top-level key of each line next to
+  `duration` and `messages`. Fine-tuning ignores it; DMD `--task_routing` requires
+  it on every line.
 
 Audio is referenced by file path under either an `audio_url` or `audio` key (both
 are accepted). Paths should be absolute. Audio is loaded, downmixed to mono, and
@@ -95,6 +98,13 @@ resampled to 24 kHz automatically, so source files can be any sample rate.
     }
   ]
 }
+```
+
+**A `train.jsonl` with task labels** (one record per line, `task` at the top level):
+
+```jsonl
+{"task": "tts", "duration": 5.66, "messages": [{"role": "user", "content": [{"type": "text", "text": "Say the following with the same voice: \"你好，这是一次语音合成测试。\""}, {"type": "audio", "audio_url": "/abs/path/ref.wav"}]}, {"role": "assistant", "content": [{"type": "audio", "audio_url": "/abs/path/target.wav"}]}]}
+{"task": "ss", "duration": 4.20, "messages": [{"role": "user", "content": [{"type": "text", "text": "Keep only the first speaker to start talking and remove all other speakers."}, {"type": "audio", "audio_url": "/abs/path/mixture.wav"}]}, {"role": "assistant", "content": [{"type": "audio", "audio_url": "/abs/path/speaker1.wav"}]}]}
 ```
 
 Every supported task uses this one format; you only change the instruction and
