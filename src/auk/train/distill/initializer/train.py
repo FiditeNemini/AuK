@@ -40,6 +40,10 @@ class ScriptArgs:
     weight_type: Literal["bf16", "fp16", "fp32"] = "bf16"
     attn_backend: str = field(default="torch", metadata={"help": "Overrides model.arch.attn_backend."})
     output_dir: str = "ckpts/auk_cm_init"
+    checkpoint_every_n_layers: int | None = field(
+        default=None,
+        metadata={"help": "Overrides model.arch.checkpoint_every_n_layers; 1 is needed for the 10000-frame batch."},
+    )
 
 
 def main() -> None:
@@ -80,6 +84,8 @@ def main() -> None:
     logger.info("Building student / teacher CFMEdit models around one shared Qwen ...")
     model_arc = OmegaConf.to_container(model_config.arch, resolve=True)
     model_arc["attn_backend"] = args.attn_backend
+    if args.checkpoint_every_n_layers is not None:
+        model_arc["checkpoint_every_n_layers"] = args.checkpoint_every_n_layers
     schedule_config = OmegaConf.to_container(model_config.get("schedule", OmegaConf.create({})), resolve=True)
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.weight_type]
     student, teacher = (
